@@ -2,3 +2,10 @@ fastapi
 uvicorn
 pydantic
 sqlalchemy
+passlib[bcrypt]
+PyJWT
+python-multipart
+reportlab
+scipy
+numpy
+joblib
