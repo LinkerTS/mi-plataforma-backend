@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
@@ -10,7 +10,7 @@ import os, sqlite3, io
 # =========================
 # APP BASE
 # =========================
-app = FastAPI(title="API Gestión de Activos", version="1.1.0")
+app = FastAPI(title="API Gestión de Activos", version="1.2.0")
 
 # CORS (para pruebas deja "*"; en prod pon tu dominio de Lovable)
 ORIGINS = ["*"]
@@ -288,7 +288,7 @@ def delete_asset(asset_id: int, user=Depends(require_role(["management"]))):
     return {"message": "Activo eliminado"}
 
 # =========================
-# EXPORT PARA POWER BI (DETALLE)
+# EXPORT PARA POWER BI (PROTEGIDO POR JWT)
 # =========================
 @app.get("/export/activos.csv")
 def export_csv(user=Depends(get_current_user)):
@@ -303,10 +303,53 @@ def export_csv(user=Depends(get_current_user)):
     writer.writerow(["id","nombre","categoria","ubicacion","tipo","area_responsable",
                      "fecha_ingreso","valor_adquisicion","estado","creado_en"])
     writer.writerows(rows)
-    return buffer.getvalue()
+    buffer.seek(0)
+    return StreamingResponse(buffer, media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="activos.csv"'})
 
 @app.get("/export/activos.json")
 def export_json(user=Depends(get_current_user)):
+    c = conn(); cur = c.cursor()
+    cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
+                          fecha_ingreso, valor_adquisicion, estado, creado_en
+                   FROM activos ORDER BY id DESC""")
+    rows = cur.fetchall(); c.close()
+    cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
+            "fecha_ingreso","valor_adquisicion","estado","creado_en"]
+    data = [dict(zip(cols, r)) for r in rows]
+    return {"data": data}
+
+# =========================
+# EXPORT PÚBLICO PARA POWER BI (API KEY por querystring)
+# =========================
+EXPORT_API_KEY = os.getenv("EXPORT_API_KEY", "dev-export-key")  # Configura en Render
+
+def check_export_key(request: Request):
+    key = request.query_params.get("key")
+    if key != EXPORT_API_KEY:
+        raise HTTPException(status_code=401, detail="API key inválida")
+
+@app.get("/export/public/activos.csv")
+def export_csv_public(request: Request):
+    check_export_key(request)
+    import csv
+    c = conn(); cur = c.cursor()
+    cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
+                          fecha_ingreso, valor_adquisicion, estado, creado_en
+                   FROM activos ORDER BY id DESC""")
+    rows = cur.fetchall(); c.close()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["id","nombre","categoria","ubicacion","tipo","area_responsable",
+                     "fecha_ingreso","valor_adquisicion","estado","creado_en"])
+    writer.writerows(rows)
+    buffer.seek(0)
+    return StreamingResponse(buffer, media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="activos.csv"'})
+
+@app.get("/export/public/activos.json")
+def export_json_public(request: Request):
+    check_export_key(request)
     c = conn(); cur = c.cursor()
     cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
                           fecha_ingreso, valor_adquisicion, estado, creado_en
@@ -337,24 +380,20 @@ def reportes_activos(user=Depends(get_current_user)):
             "fecha_ingreso","valor_adquisicion","estado","creado_en"]
     data = [dict(zip(cols, r)) for r in rows]
 
-    # KPIs básicos
     total = len(data)
     activos = sum(1 for d in data if (d["estado"] or "").lower() == "activo")
     bajas = sum(1 for d in data if (d["estado"] or "").lower() == "baja")
 
-    # Por estado
     por_estado = {}
     for d in data:
         key = (d["estado"] or "desconocido").lower()
         por_estado[key] = por_estado.get(key, 0) + 1
 
-    # Por categoría
     por_categoria = {}
     for d in data:
         key = (d["categoria"] or "sin_categoria")
         por_categoria[key] = por_categoria.get(key, 0) + 1
 
-    # Por mes de ingreso (YYYY-MM)
     por_mes = {}
     for d in data:
         fi = (d["fecha_ingreso"] or "")
@@ -456,7 +495,7 @@ def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervi
     ]
     buf = _pdf_from_pairs("Acta de Baja de Bien", pairs)
     return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="acta_baja_${asset_id}.pdf"'})
+        headers={"Content-Disposition": f'attachment; filename="acta_baja_{asset_id}.pdf"'})
 
 @app.get("/reportes/instantaneo.pdf")
 def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
