@@ -10,13 +10,12 @@ import os, sqlite3, io
 # =========================
 # APP BASE
 # =========================
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 app = FastAPI(title="API Gestión de Activos", version=APP_VERSION)
 
 # CORS desde variables de entorno (por defecto "*")
 origins_env = os.getenv("ORIGINS", "*")
 ORIGINS = [""] if origins_env.strip() == "" else [o.strip() for o in origins_env.split(",") if o.strip()]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
@@ -31,8 +30,8 @@ app.add_middleware(
 DB_NAME = os.getenv("DB_NAME", "activos.db")
 
 def get_conn():
-    # Buenas prácticas mínimas para SQLite en servicios web
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False, isolation_level=None)  # autocommit
+    # SQLite seguro para uso en servicio web (autocommit + WAL)
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
@@ -158,11 +157,7 @@ def ensure_admin_seed():
 ensure_admin_seed()
 
 def create_token(email: str, role: str):
-    payload = {
-        "sub": email,
-        "role": role,
-        "exp": (datetime.utcnow() + timedelta(hours=8))
-    }
+    payload = {"sub": email, "role": role, "exp": (datetime.utcnow() + timedelta(hours=8))}
     return jwt.encode(payload, JWT_SECRET, algorithm=ALGORITHM)
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
