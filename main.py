@@ -10,10 +10,13 @@ import os, sqlite3, io
 # =========================
 # APP BASE
 # =========================
-app = FastAPI(title="API Gestión de Activos", version="1.2.0")
+APP_VERSION = "1.3.0"
+app = FastAPI(title="API Gestión de Activos", version=APP_VERSION)
 
-# CORS (para pruebas deja "*"; en prod pon tu dominio de Lovable)
-ORIGINS = ["*"]
+# CORS desde variables de entorno (por defecto "*")
+origins_env = os.getenv("ORIGINS", "*")
+ORIGINS = [""] if origins_env.strip() == "" else [o.strip() for o in origins_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
@@ -25,52 +28,54 @@ app.add_middleware(
 # =========================
 # DB
 # =========================
-DB_NAME = "activos.db"
+DB_NAME = os.getenv("DB_NAME", "activos.db")
 
-def conn():
-    return sqlite3.connect(DB_NAME)
+def get_conn():
+    # Buenas prácticas mínimas para SQLite en servicios web
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False, isolation_level=None)  # autocommit
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
 def init_db():
-    c = conn(); cur = c.cursor()
-    # Tabla de activos
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS activos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nombre TEXT NOT NULL,
-        descripcion TEXT,
-        categoria TEXT,
-        ubicacion TEXT,
-        factura TEXT,
-        proveedor TEXT,
-        tipo TEXT,
-        area_responsable TEXT,
-        fecha_ingreso TEXT,
-        valor_adquisicion REAL,
-        estado TEXT,
-        creado_en TEXT
-    )
-    """)
-    # Tabla de usuarios (auth)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL
-    )
-    """)
-    # Tabla de etiquetas ML (para entrenar luego)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ml_labels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        asset_id INTEGER NOT NULL,
-        label INTEGER NOT NULL,        -- 1: crítico/obsoleto, 0: ok
-        timestamp TEXT NOT NULL,
-        FOREIGN KEY(asset_id) REFERENCES activos(id)
-    )
-    """)
-    c.commit(); c.close()
-
+    with get_conn() as c:
+        cur = c.cursor()
+        # Tabla de activos
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS activos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT NOT NULL,
+            descripcion TEXT,
+            categoria TEXT,
+            ubicacion TEXT,
+            factura TEXT,
+            proveedor TEXT,
+            tipo TEXT,
+            area_responsable TEXT,
+            fecha_ingreso TEXT,
+            valor_adquisicion REAL,
+            estado TEXT,
+            creado_en TEXT
+        )
+        """)
+        # Tabla de usuarios (auth)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL
+        )
+        """)
+        # Tabla de etiquetas ML (para entrenar luego)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ml_labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER NOT NULL,
+            label INTEGER NOT NULL,        -- 1: crítico/obsoleto, 0: ok
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY(asset_id) REFERENCES activos(id)
+        )
+        """)
 init_db()
 
 # =========================
@@ -144,14 +149,12 @@ DOMAIN_ROLE_MAP = {
 }
 
 def ensure_admin_seed():
-    c = conn(); cur = c.cursor()
-    cur.execute("SELECT id FROM users WHERE email=?", ("admin@demo.com",))
-    if not cur.fetchone():
-        cur.execute("INSERT INTO users (email,password_hash,role) VALUES (?,?,?)",
-                    ("admin@demo.com", bcrypt.hash("admin123"), "management"))
-        c.commit()
-    c.close()
-
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("SELECT id FROM users WHERE email=?", ("admin@demo.com",))
+        if not cur.fetchone():
+            cur.execute("INSERT INTO users (email,password_hash,role) VALUES (?,?,?)",
+                        ("admin@demo.com", bcrypt.hash("admin123"), "management"))
 ensure_admin_seed()
 
 def create_token(email: str, role: str):
@@ -170,11 +173,12 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     email = payload.get("sub"); role = payload.get("role")
     if not email:
         raise HTTPException(status_code=401, detail="Token inválido")
-    c = conn(); cur = c.cursor()
-    cur.execute("SELECT email, role FROM users WHERE email=?", (email,))
-    row = cur.fetchone(); c.close()
-    if not row:
-        raise HTTPException(status_code=401, detail="Usuario no encontrado")
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("SELECT email, role FROM users WHERE email=?", (email,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="Usuario no encontrado")
     return {"email": row[0], "role": row[1]}
 
 def require_role(roles: List[str]):
@@ -194,40 +198,54 @@ def register(user: UserCreate, current=Depends(require_role(["management"]))):
             role = DOMAIN_ROLE_MAP.get(domain, "storekeeper")
         except:
             role = "storekeeper"
-    c = conn(); cur = c.cursor()
     try:
-        cur.execute("INSERT INTO users (email,password_hash,role) VALUES (?,?,?)",
-                    (user.email, bcrypt.hash(user.password), role))
-        c.commit()
+        with get_conn() as c:
+            cur = c.cursor()
+            cur.execute("INSERT INTO users (email,password_hash,role) VALUES (?,?,?)",
+                        (user.email, bcrypt.hash(user.password), role))
     except sqlite3.IntegrityError:
-        c.close(); raise HTTPException(status_code=400, detail="Email ya registrado")
-    c.close()
+        raise HTTPException(status_code=400, detail="Email ya registrado")
     return {"message": "Usuario creado", "role_asignado": role}
 
 @app.post("/auth/login")
 def login(form: OAuth2PasswordRequestForm = Depends()):
-    c = conn(); cur = c.cursor()
-    cur.execute("SELECT email, password_hash, role FROM users WHERE email=?", (form.username,))
-    row = cur.fetchone(); c.close()
-    if not row or not bcrypt.verify(form.password, row[1]):
-        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("SELECT email, password_hash, role FROM users WHERE email=?", (form.username,))
+        row = cur.fetchone()
+        if not row or not bcrypt.verify(form.password, row[1]):
+            raise HTTPException(status_code=401, detail="Credenciales inválidas")
     token = create_token(row[0], row[2])
     return {"access_token": token, "token_type": "bearer", "role": row[2]}
+
+# =========================
+# HELPERS EXPORT
+# =========================
+EXPORT_COLUMNS = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
+                  "fecha_ingreso","valor_adquisicion","estado","creado_en"]
+
+def fetch_export_rows():
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute(f"""SELECT {", ".join(EXPORT_COLUMNS)}
+                        FROM activos ORDER BY id DESC""")
+        return cur.fetchall()
 
 # =========================
 # ENDPOINTS CRUD
 # =========================
 @app.get("/")
 def root():
-    return {"message": "API de gestión de activos funcionando"}
+    return {"message": "API de gestión de activos funcionando", "version": APP_VERSION}
 
 @app.get("/activos", response_model=List[AssetOut])
 def get_assets(user=Depends(get_current_user)):
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
-                          tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos ORDER BY id DESC""")
-    rows = cur.fetchall(); c.close()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
+                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
+                       FROM activos ORDER BY id DESC""")
+        rows = cur.fetchall()
     return [AssetOut(
         id=r[0], nombre=r[1], descripcion=r[2], categoria=r[3], ubicacion=r[4],
         factura=r[5], proveedor=r[6], tipo=r[7], area_responsable=r[8],
@@ -236,11 +254,12 @@ def get_assets(user=Depends(get_current_user)):
 
 @app.get("/activos/{asset_id}", response_model=AssetOut)
 def get_asset(asset_id: int, user=Depends(get_current_user)):
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
-                          tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos WHERE id=?""", (asset_id,))
-    r = cur.fetchone(); c.close()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
+                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
+                       FROM activos WHERE id=?""", (asset_id,))
+        r = cur.fetchone()
     if not r:
         raise HTTPException(status_code=404, detail="Activo no encontrado")
     return AssetOut(
@@ -251,40 +270,39 @@ def get_asset(asset_id: int, user=Depends(get_current_user)):
 
 @app.post("/activos", response_model=AssetOut, status_code=201)
 def create_asset(asset: AssetCreate, user=Depends(require_role(["storekeeper","supervisor"]))):
-    c = conn(); cur = c.cursor()
     creado_en = datetime.utcnow().isoformat()
-    cur.execute("""
-        INSERT INTO activos (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
-                             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (asset.nombre, asset.descripcion, asset.categoria, asset.ubicacion, asset.factura, asset.proveedor,
-          asset.tipo, asset.area_responsable, asset.fecha_ingreso, asset.valor_adquisicion, asset.estado, creado_en))
-    c.commit()
-    new_id = cur.lastrowid
-    c.close()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""
+            INSERT INTO activos (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
+                                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (asset.nombre, asset.descripcion, asset.categoria, asset.ubicacion, asset.factura, asset.proveedor,
+              asset.tipo, asset.area_responsable, asset.fecha_ingreso, asset.valor_adquisicion, asset.estado, creado_en))
+        new_id = cur.lastrowid
     return get_asset(new_id, user)
 
 @app.put("/activos/{asset_id}")
 def update_asset(asset_id: int, up: AssetUpdate, user=Depends(require_role(["supervisor","technical"]))):
-    c = conn(); cur = c.cursor()
-    cur.execute("SELECT id FROM activos WHERE id=?", (asset_id,))
-    if not cur.fetchone():
-        c.close(); raise HTTPException(status_code=404, detail="Activo no encontrado")
-    fields, values = [], []
-    for k, v in up.dict(exclude_unset=True).items():
-        fields.append(f"{k}=?"); values.append(v)
-    if fields:
-        q = f"UPDATE activos SET {', '.join(fields)} WHERE id=?"
-        values.append(asset_id)
-        cur.execute(q, tuple(values)); c.commit()
-    c.close()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("SELECT id FROM activos WHERE id=?", (asset_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Activo no encontrado")
+        fields, values = [], []
+        for k, v in up.dict(exclude_unset=True).items():
+            fields.append(f"{k}=?"); values.append(v)
+        if fields:
+            q = f"UPDATE activos SET {', '.join(fields)} WHERE id=?"
+            values.append(asset_id)
+            cur.execute(q, tuple(values))
     return {"message": "Activo actualizado"}
 
 @app.delete("/activos/{asset_id}")
 def delete_asset(asset_id: int, user=Depends(require_role(["management"]))):
-    c = conn(); cur = c.cursor()
-    cur.execute("DELETE FROM activos WHERE id=?", (asset_id,))
-    c.commit(); c.close()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("DELETE FROM activos WHERE id=?", (asset_id,))
     return {"message": "Activo eliminado"}
 
 # =========================
@@ -293,15 +311,10 @@ def delete_asset(asset_id: int, user=Depends(require_role(["management"]))):
 @app.get("/export/activos.csv")
 def export_csv(user=Depends(get_current_user)):
     import csv
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
-                          fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos ORDER BY id DESC""")
-    rows = cur.fetchall(); c.close()
+    rows = fetch_export_rows()
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["id","nombre","categoria","ubicacion","tipo","area_responsable",
-                     "fecha_ingreso","valor_adquisicion","estado","creado_en"])
+    writer.writerow(EXPORT_COLUMNS)
     writer.writerows(rows)
     buffer.seek(0)
     return StreamingResponse(buffer, media_type="text/csv",
@@ -309,14 +322,8 @@ def export_csv(user=Depends(get_current_user)):
 
 @app.get("/export/activos.json")
 def export_json(user=Depends(get_current_user)):
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
-                          fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos ORDER BY id DESC""")
-    rows = cur.fetchall(); c.close()
-    cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
-            "fecha_ingreso","valor_adquisicion","estado","creado_en"]
-    data = [dict(zip(cols, r)) for r in rows]
+    rows = fetch_export_rows()
+    data = [dict(zip(EXPORT_COLUMNS, r)) for r in rows]
     return {"data": data}
 
 # =========================
@@ -333,15 +340,10 @@ def check_export_key(request: Request):
 def export_csv_public(request: Request):
     check_export_key(request)
     import csv
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
-                          fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos ORDER BY id DESC""")
-    rows = cur.fetchall(); c.close()
+    rows = fetch_export_rows()
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["id","nombre","categoria","ubicacion","tipo","area_responsable",
-                     "fecha_ingreso","valor_adquisicion","estado","creado_en"])
+    writer.writerow(EXPORT_COLUMNS)
     writer.writerows(rows)
     buffer.seek(0)
     return StreamingResponse(buffer, media_type="text/csv",
@@ -350,14 +352,8 @@ def export_csv_public(request: Request):
 @app.get("/export/public/activos.json")
 def export_json_public(request: Request):
     check_export_key(request)
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
-                          fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos ORDER BY id DESC""")
-    rows = cur.fetchall(); c.close()
-    cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
-            "fecha_ingreso","valor_adquisicion","estado","creado_en"]
-    data = [dict(zip(cols, r)) for r in rows]
+    rows = fetch_export_rows()
+    data = [dict(zip(EXPORT_COLUMNS, r)) for r in rows]
     return {"data": data}
 
 # =========================
@@ -365,17 +361,12 @@ def export_json_public(request: Request):
 # =========================
 @app.get("/reportes/activos")
 def reportes_activos(user=Depends(get_current_user)):
-    """
-    Devuelve KPIs + tablas agregadas + detalle.
-    Power BI puede conectarse aquí y usar ambas cosas.
-    """
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
-                          fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos""")
-    rows = cur.fetchall()
-    c.close()
-
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
+                              fecha_ingreso, valor_adquisicion, estado, creado_en
+                       FROM activos""")
+        rows = cur.fetchall()
     cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
             "fecha_ingreso","valor_adquisicion","estado","creado_en"]
     data = [dict(zip(cols, r)) for r in rows]
@@ -384,18 +375,12 @@ def reportes_activos(user=Depends(get_current_user)):
     activos = sum(1 for d in data if (d["estado"] or "").lower() == "activo")
     bajas = sum(1 for d in data if (d["estado"] or "").lower() == "baja")
 
-    por_estado = {}
+    por_estado, por_categoria, por_mes = {}, {}, {}
     for d in data:
-        key = (d["estado"] or "desconocido").lower()
-        por_estado[key] = por_estado.get(key, 0) + 1
-
-    por_categoria = {}
-    for d in data:
-        key = (d["categoria"] or "sin_categoria")
-        por_categoria[key] = por_categoria.get(key, 0) + 1
-
-    por_mes = {}
-    for d in data:
+        key_e = (d["estado"] or "desconocido").lower()
+        por_estado[key_e] = por_estado.get(key_e, 0) + 1
+        key_c = (d["categoria"] or "sin_categoria")
+        por_categoria[key_c] = por_categoria.get(key_c, 0) + 1
         fi = (d["fecha_ingreso"] or "")
         ym = fi[:7] if len(fi) >= 7 else "sin_fecha"
         por_mes[ym] = por_mes.get(ym, 0) + 1
@@ -421,11 +406,12 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
 def _fetch_asset(asset_id: int):
-    c = conn(); cur = c.cursor()
-    cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
-                          tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
-                   FROM activos WHERE id=?""", (asset_id,))
-    r = cur.fetchone(); c.close()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
+                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
+                       FROM activos WHERE id=?""", (asset_id,))
+        r = cur.fetchone()
     if not r:
         raise HTTPException(status_code=404, detail="Activo no encontrado")
     cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
@@ -477,9 +463,9 @@ def comprobante_ingreso(asset_id: int, user=Depends(get_current_user)):
 
 @app.post("/activos/{asset_id}/baja")
 def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervisor","management"]))):
-    c = conn(); cur = c.cursor()
-    cur.execute("UPDATE activos SET estado=? WHERE id=?", ("baja", asset_id))
-    c.commit(); c.close()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("UPDATE activos SET estado=? WHERE id=?", ("baja", asset_id))
     a = _fetch_asset(asset_id)
     hoy = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     pairs = [
@@ -499,14 +485,8 @@ def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervi
 
 @app.get("/reportes/instantaneo.pdf")
 def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
-    """
-    Genera un PDF ejecutivo con KPIs y cortes principales (conteos).
-    NO es el PDF de Power BI (ese requiere licencias). Es un reporte local
-    para descargar automáticamente desde la plataforma.
-    """
     rep = reportes_activos(user)  # reutiliza el endpoint optimizado
-    k = rep["kpis"]
-    agg = rep["agregados"]
+    k = rep["kpis"]; agg = rep["agregados"]
 
     hoy = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     lines = [
