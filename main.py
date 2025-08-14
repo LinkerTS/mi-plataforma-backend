@@ -10,7 +10,7 @@ import os, sqlite3, io
 # =========================
 # APP BASE
 # =========================
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 app = FastAPI(title="API Gestión de Activos", version=APP_VERSION)
 
 # CORS desde variables de entorno (por defecto "*")
@@ -130,9 +130,9 @@ class BajaRequest(BaseModel):
     motivo: str
 
 # =========================
-# AUTH + ROLES (JWT)
+# AUTH + ROLES (JWT)  -> PBKDF2 en lugar de bcrypt
 # =========================
-from passlib.hash import bcrypt
+from passlib.hash import pbkdf2_sha256 as hasher
 import jwt
 
 JWT_SECRET = os.getenv("JWT_SECRET", "devsecret-change-me")
@@ -153,7 +153,7 @@ def ensure_admin_seed():
         cur.execute("SELECT id FROM users WHERE email=?", ("admin@demo.com",))
         if not cur.fetchone():
             cur.execute("INSERT INTO users (email,password_hash,role) VALUES (?,?,?)",
-                        ("admin@demo.com", bcrypt.hash("admin123"), "management"))
+                        ("admin@demo.com", hasher.hash("admin123"), "management"))
 ensure_admin_seed()
 
 def create_token(email: str, role: str):
@@ -185,7 +185,6 @@ def require_role(roles: List[str]):
 
 @app.post("/auth/register")
 def register(user: UserCreate, current=Depends(require_role(["management"]))):
-    # Asignación automática por dominio si no envía role
     role = (user.role or "").strip()
     if not role:
         try:
@@ -197,7 +196,7 @@ def register(user: UserCreate, current=Depends(require_role(["management"]))):
         with get_conn() as c:
             cur = c.cursor()
             cur.execute("INSERT INTO users (email,password_hash,role) VALUES (?,?,?)",
-                        (user.email, bcrypt.hash(user.password), role))
+                        (user.email, hasher.hash(user.password), role))
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="Email ya registrado")
     return {"message": "Usuario creado", "role_asignado": role}
@@ -208,7 +207,7 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
         cur = c.cursor()
         cur.execute("SELECT email, password_hash, role FROM users WHERE email=?", (form.username,))
         row = cur.fetchone()
-        if not row or not bcrypt.verify(form.password, row[1]):
+        if not row or not hasher.verify(form.password, row[1]):
             raise HTTPException(status_code=401, detail="Credenciales inválidas")
     token = create_token(row[0], row[2])
     return {"access_token": token, "token_type": "bearer", "role": row[2]}
@@ -324,12 +323,17 @@ def export_json(user=Depends(get_current_user)):
 # =========================
 # EXPORT PÚBLICO PARA POWER BI (API KEY por querystring)
 # =========================
-EXPORT_API_KEY = os.getenv("EXPORT_API_KEY", "dev-export-key")  # Configura en Render
+EXPORT_API_KEY = os.getenv("EXPORT_API_KEY", "dev-export-key")
 
 def check_export_key(request: Request):
     key = request.query_params.get("key")
     if key != EXPORT_API_KEY:
         raise HTTPException(status_code=401, detail="API key inválida")
+
+@app.get("/export/public/ping")
+def export_ping(request: Request):
+    check_export_key(request)
+    return {"ok": True, "msg": "key válida"}
 
 @app.get("/export/public/activos.csv")
 def export_csv_public(request: Request):
@@ -339,7 +343,8 @@ def export_csv_public(request: Request):
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(EXPORT_COLUMNS)
-    writer.writerows(rows)
+    if rows:
+        writer.writerows(rows)
     buffer.seek(0)
     return StreamingResponse(buffer, media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="activos.csv"'})
@@ -511,6 +516,7 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
 # =========================
 # FIN
 # =========================
+
 
 ###################
 # --- Diagnóstico rápido ---
