@@ -516,8 +516,6 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
 # =========================
 # FIN
 # =========================
-
-
 ###################
 # --- Diagnóstico rápido ---
 @app.get("/export/public/ping")
