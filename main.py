@@ -10,7 +10,7 @@ import os, sqlite3, io
 # =========================
 # APP BASE
 # =========================
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 app = FastAPI(title="API Gestión de Activos", version=APP_VERSION)
 
 # CORS desde variables de entorno (por defecto "*")
