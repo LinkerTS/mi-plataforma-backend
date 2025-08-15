@@ -330,32 +330,63 @@ def check_export_key(request: Request):
     if key != EXPORT_API_KEY:
         raise HTTPException(status_code=401, detail="API key inválida")
 
+# (opcional) Ping protegido: para probar rápidamente la key
 @app.get("/export/public/ping")
 def export_ping(request: Request):
     check_export_key(request)
     return {"ok": True, "msg": "key válida"}
 
+# (opcional) Debug protegido: confirma columnas/filas sin descargar CSV
+@app.get("/debug/export/check")
+def debug_export_check(request: Request):
+    check_export_key(request)
+    try:
+        rows = fetch_export_rows()
+        return {
+            "ok": True,
+            "columns": EXPORT_COLUMNS,
+            "row_count": len(rows),
+            "sample": rows[:3],
+        }
+    except Exception as e:
+        print("DEBUG export error:", repr(e))
+        raise HTTPException(status_code=500, detail=f"debug_error: {type(e)._name_}")
+
 @app.get("/export/public/activos.csv")
 def export_csv_public(request: Request):
     check_export_key(request)
-    import csv
-    rows = fetch_export_rows()
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(EXPORT_COLUMNS)
-    if rows:
-        writer.writerows(rows)
-    buffer.seek(0)
-    return StreamingResponse(buffer, media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="activos.csv"'})
+    try:
+        import csv
+        rows = fetch_export_rows()
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(EXPORT_COLUMNS)
+        if rows:
+            writer.writerows(rows)
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="activos.csv"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("ERROR export_csv_public:", repr(e))
+        raise HTTPException(status_code=500, detail="Error generando CSV")
 
 @app.get("/export/public/activos.json")
 def export_json_public(request: Request):
     check_export_key(request)
-    rows = fetch_export_rows()
-    data = [dict(zip(EXPORT_COLUMNS, r)) for r in rows]
-    return {"data": data}
-
+    try:
+        rows = fetch_export_rows()
+        data = [dict(zip(EXPORT_COLUMNS, r)) for r in rows]
+        return {"data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("ERROR export_json_public:", repr(e))
+        raise HTTPException(status_code=500, detail="Error generando JSON")
 # =========================
 # ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE)
 # =========================
