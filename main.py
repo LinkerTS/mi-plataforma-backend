@@ -388,6 +388,33 @@ def export_json_public(request: Request):
         print("ERROR export_json_public:", repr(e))
         raise HTTPException(status_code=500, detail="Error generando JSON")
 # =========================
+# DEBUG: listar rutas y revisar export
+# =========================
+@app.get("/debug/routes")
+def debug_routes():
+    # Lista TODAS las rutas registradas (para verificar que /export/public/activos.csv existe)
+    return {"routes": [getattr(r, "path", str(r)) for r in app.routes]}
+
+@app.get("/debug/export/check")
+def debug_export_check():
+    # NO requiere key para que puedas ver el motivo real del 500
+    try:
+        rows = fetch_export_rows()
+        return {
+            "ok": True,
+            "columns": EXPORT_COLUMNS,
+            "row_count": len(rows),
+            "sample": rows[:3],
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "ok": False,
+            "error_type": type(e)._name_,
+            "error_msg": str(e),
+            "trace": traceback.format_exc().splitlines()[-5:],
+        }
+# =========================
 # ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE)
 # =========================
 @app.get("/reportes/activos")
