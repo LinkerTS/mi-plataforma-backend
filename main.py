@@ -10,7 +10,7 @@ import os, sqlite3, io
 # =========================
 # APP BASE
 # =========================
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 app = FastAPI(title="API Gestión de Activos", version=APP_VERSION)
 
 # CORS desde variables de entorno (por defecto "*")
@@ -75,7 +75,37 @@ def init_db():
             FOREIGN KEY(asset_id) REFERENCES activos(id)
         )
         """)
+
+# --- Migración automática: agrega columnas faltantes en 'activos' si la DB es vieja ---
+def ensure_activos_columns():
+    """
+    Migra la tabla 'activos' si faltan columnas de versiones anteriores.
+    No borra datos; solo agrega columnas faltantes con valores NULL.
+    """
+    needed = {
+        "descripcion": "TEXT",
+        "categoria": "TEXT",
+        "ubicacion": "TEXT",
+        "factura": "TEXT",
+        "proveedor": "TEXT",
+        "tipo": "TEXT",
+        "area_responsable": "TEXT",
+        "fecha_ingreso": "TEXT",
+        "valor_adquisicion": "REAL",
+        "estado": "TEXT",
+        "creado_en": "TEXT",
+    }
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("PRAGMA table_info(activos)")
+        existing = {row[1] for row in cur.fetchall()}
+        for col, coltype in needed.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE activos ADD COLUMN {col} {coltype}")
+
+# Inicializa y migra
 init_db()
+ensure_activos_columns()
 
 # =========================
 # MODELOS
@@ -330,27 +360,11 @@ def check_export_key(request: Request):
     if key != EXPORT_API_KEY:
         raise HTTPException(status_code=401, detail="API key inválida")
 
-# (opcional) Ping protegido: para probar rápidamente la key
+# Ping protegido: para probar rápidamente la key
 @app.get("/export/public/ping")
 def export_ping(request: Request):
     check_export_key(request)
     return {"ok": True, "msg": "key válida"}
-
-# (opcional) Debug protegido: confirma columnas/filas sin descargar CSV
-@app.get("/debug/export/check")
-def debug_export_check(request: Request):
-    check_export_key(request)
-    try:
-        rows = fetch_export_rows()
-        return {
-            "ok": True,
-            "columns": EXPORT_COLUMNS,
-            "row_count": len(rows),
-            "sample": rows[:3],
-        }
-    except Exception as e:
-        print("DEBUG export error:", repr(e))
-        raise HTTPException(status_code=500, detail=f"debug_error: {type(e)._name_}")
 
 @app.get("/export/public/activos.csv")
 def export_csv_public(request: Request):
@@ -387,17 +401,22 @@ def export_json_public(request: Request):
     except Exception as e:
         print("ERROR export_json_public:", repr(e))
         raise HTTPException(status_code=500, detail="Error generando JSON")
-# =========================
-# DEBUG: listar rutas y revisar export
-# =========================
-@app.get("/debug/routes")
-def debug_routes():
-    # Lista TODAS las rutas registradas (para verificar que /export/public/activos.csv existe)
-    return {"routes": [getattr(r, "path", str(r)) for r in app.routes]}
 
-@app.get("/debug/export/check")
-def debug_export_check():
-    # NO requiere key para que puedas ver el motivo real del 500
+# =========================
+# DEBUG (no aparecen en /docs)
+# =========================
+@app.get("/_debug/routes", include_in_schema=False)
+def _debug_routes():
+    try:
+        return {"routes": [getattr(r, "path", str(r)) for r in app.routes]}
+    except Exception as e:
+        return {"ok": False, "err": type(e).__name__, "msg": str(e)}
+
+@app.get("/_debug/export/check", include_in_schema=False)
+def _debug_export_check():
+    """
+    NO requiere API key. Solo comprueba que fetch_export_rows() funciona.
+    """
     try:
         rows = fetch_export_rows()
         return {
@@ -410,10 +429,37 @@ def debug_export_check():
         import traceback
         return {
             "ok": False,
-            "error_type": type(e)._name_,
+            "error_type": type(e).__name__,
             "error_msg": str(e),
-            "trace": traceback.format_exc().splitlines()[-5:],
+            "trace": traceback.format_exc().splitlines()[-8:],
         }
+
+@app.post("/_debug/seed", include_in_schema=False)
+def _debug_seed(request: Request):
+    """
+    Inserta 2 filas demo. Protegido con la misma API key pública del export.
+    """
+    check_export_key(request)  # requiere ?key=...
+    from random import randint
+    now = datetime.utcnow().isoformat()
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""INSERT INTO activos 
+            (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo, 
+             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"Activo Demo {randint(100,999)}", "Equipo de prueba", "IT", "Almacén A",
+             "F-00123", "Proveedor X", "Hardware", "Sistemas", "2025-08-01", 1200.50, "activo", now)
+        )
+        cur.execute("""INSERT INTO activos 
+            (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo, 
+             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"Activo Demo {randint(100,999)}", "Equipo de prueba", "Infraestructura", "Planta 1",
+             "F-00456", "Proveedor Y", "Maquinaria", "Mantenimiento", "2025-07-15", 5400.00, "activo", now)
+        )
+    return {"ok": True, "msg": "Semilla insertada"}
+
 # =========================
 # ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE)
 # =========================
@@ -574,60 +620,3 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
 # =========================
 # FIN
 # =========================
-# =========================
-# DEBUG (no aparecen en /docs)
-# =========================
-@app.get("/_debug/routes", include_in_schema=False)
-def _debug_routes():
-    try:
-        return {"routes": [getattr(r, "path", str(r)) for r in app.routes]}
-    except Exception as e:
-        return {"ok": False, "err": type(e).__name__, "msg": str(e)}
-
-@app.get("/_debug/export/check", include_in_schema=False)
-def _debug_export_check():
-    """
-    NO requiere API key. Solo comprueba que fetch_export_rows() funciona.
-    """
-    try:
-        rows = fetch_export_rows()
-        return {
-            "ok": True,
-            "columns": EXPORT_COLUMNS,
-            "row_count": len(rows),
-            "sample": rows[:3],
-        }
-    except Exception as e:
-        import traceback
-        return {
-            "ok": False,
-            "error_type": type(e).__name__,
-            "error_msg": str(e),
-            "trace": traceback.format_exc().splitlines()[-8:],
-        }
-
-@app.post("/_debug/seed", include_in_schema=False)
-def _debug_seed(request: Request):
-    """
-    Inserta 2 filas demo. Protegido con la misma API key pública del export.
-    """
-    check_export_key(request)  # requiere ?key=...
-    from random import randint
-    now = datetime.utcnow().isoformat()
-    with get_conn() as c:
-        cur = c.cursor()
-        cur.execute("""INSERT INTO activos 
-            (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo, 
-             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"Activo Demo {randint(100,999)}", "Equipo de prueba", "IT", "Almacén A",
-             "F-00123", "Proveedor X", "Hardware", "Sistemas", "2025-08-01", 1200.50, "activo", now)
-        )
-        cur.execute("""INSERT INTO activos 
-            (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo, 
-             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (f"Activo Demo {randint(100,999)}", "Equipo de prueba", "Infraestructura", "Planta 1",
-             "F-00456", "Proveedor Y", "Maquinaria", "Mantenimiento", "2025-07-15", 5400.00, "activo", now)
-        )
-    return {"ok": True, "msg": "Semilla insertada"}
