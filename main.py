@@ -6,6 +6,10 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
 import os, sqlite3, io
+import csv
+from io import TextIOWrapper
+from typing import Iterable
+
 
 # =========================
 # APP BASE
@@ -460,6 +464,50 @@ def _debug_seed(request: Request):
         )
     return {"ok": True, "msg": "Semilla insertada"}
 
+@app.post("/_debug/import/csv", include_in_schema=False)
+async def _debug_import_csv(request: Request):
+    """
+    Sube un CSV (form-data → file) e inserta filas en 'activos'.
+    Requiere ?key=EXPORT_API_KEY.
+    """
+    check_export_key(request)
+    form = await request.form()
+    if "file" not in form:
+        raise HTTPException(status_code=400, detail="Sube el archivo CSV en form-data con campo 'file'")
+    file = form["file"]
+    inserted = 0
+    with get_conn() as c:
+        cur = c.cursor()
+        for row in _rows_from_csv(file.file):
+            cur.execute("""
+                INSERT INTO activos
+                (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
+                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                row["nombre"], row["descripcion"], row["categoria"], row["ubicacion"],
+                row["factura"], row["proveedor"], row["tipo"], row["area_responsable"],
+                row["fecha_ingreso"], row["valor_adquisicion"], row["estado"], row["creado_en"]
+            ))
+            inserted += 1
+    return {"ok": True, "inserted": inserted}
+
+@app.post("/_debug/wipe", include_in_schema=False)
+def _debug_wipe(request: Request):
+    """Borra todos los registros de 'activos'. Requiere ?key=EXPORT_API_KEY."""
+    check_export_key(request)
+    with get_conn() as c:
+        c.execute("DELETE FROM activos")
+    return {"ok": True, "message": "Tabla 'activos' vaciada"}
+
+@app.post("/_debug/migrate", include_in_schema=False)
+def _debug_migrate(request: Request):
+    """Ejecuta la migración de columnas faltantes en 'activos'. Requiere ?key=EXPORT_API_KEY."""
+    check_export_key(request)
+    ensure_activos_columns()
+    return {"ok": True, "message": "Migración aplicada"}
+
+
 # =========================
 # ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE)
 # =========================
@@ -502,6 +550,130 @@ def reportes_activos(user=Depends(get_current_user)):
         },
         "detalle": data
     }
+# =========================
+# IMPORT CSV + WIPE + MIGRACIÓN (endpoints administrativos)
+# =========================
+def _normalize_date(value: str) -> str:
+    """
+    Normaliza fechas a YYYY-MM-DD cuando es posible.
+    Acepta 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD/MM/YYYY', 'MM/DD/YYYY'.
+    Si no reconoce, devuelve tal cual.
+    """
+    if not value:
+        return ""
+    v = str(value).strip().replace("\\", "/")
+    try:
+        # YYYY-MM-DD
+        if len(v) >= 10 and v[4] == "-" and v[7] == "-":
+            return v[:10]
+        # YYYY/MM/DD
+        if len(v) >= 10 and v[4] == "/" and v[7] == "/":
+            y, m, d = v[:10].split("/")
+            return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+        # DD/MM/YYYY
+        if "/" in v and len(v) >= 10 and v.count("/") == 2:
+            d, m, y = v[:10].split("/")
+            if len(y) == 4:
+                return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+        # MM/DD/YYYY
+        if "-" not in v and "/" in v and len(v) >= 10:
+            m, d, y = v[:10].split("/")
+            if len(y) == 4:
+                return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+    except Exception:
+        pass
+    return v
+
+def _to_float(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s == "" or s.lower() == "nan":
+        return None
+    s = s.replace(" ", "")
+    # 1.234,56 -> 1234.56
+    if s.count(",") == 1 and s.count(".") > 1:
+        s = s.replace(".", "").replace(",", ".")
+    elif s.count(",") == 1 and "." not in s:
+        s = s.replace(",", ".")
+    else:
+        s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _rows_from_csv(file_stream) -> Iterable[dict]:
+    """
+    Lee un CSV (utf-8/utf-8-sig) y mapea cabeceras comunes a nuestro esquema.
+    Cabeceras objetivo: nombre, descripcion, categoria, ubicacion, factura, proveedor,
+    tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en.
+    """
+    wrapper = TextIOWrapper(file_stream, encoding="utf-8-sig")
+    reader = csv.DictReader(wrapper)
+    header_map = {
+        # iguales
+        "id": "id",
+        "nombre": "nombre",
+        "descripcion": "descripcion",
+        "categoria": "categoria",
+        "ubicacion": "ubicacion",
+        "factura": "factura",
+        "proveedor": "proveedor",
+        "tipo": "tipo",
+        "area_responsable": "area_responsable",
+        "fecha_ingreso": "fecha_ingreso",
+        "valor_adquisicion": "valor_adquisicion",
+        "estado": "estado",
+        "creado_en": "creado_en",
+        # variantes típicas
+        "numero de activo fijo": "nombre",
+        "nombre del activo": "nombre",
+        "grupo": "categoria",
+        "conjunto de activos fijos": "categoria",
+        "departamento": "ubicacion",
+        "custodio": "area_responsable",
+        "libro": "tipo",
+        "tipo de libro": "tipo",
+        "fecha de adquisición": "fecha_ingreso",
+        "precio de adquisición": "valor_adquisicion",
+        "valor neto en libros": "valor_adquisicion",
+    }
+    for raw in reader:
+        # fila completamente vacía -> saltar
+        if not any((raw.get(k) or "").strip() for k in raw.keys()):
+            continue
+        out = {
+            "nombre": None,
+            "descripcion": (raw.get("descripcion") or "").strip(),
+            "categoria": None,
+            "ubicacion": None,
+            "factura": (raw.get("factura") or "").strip(),
+            "proveedor": (raw.get("proveedor") or "").strip(),
+            "tipo": None,
+            "area_responsable": None,
+            "fecha_ingreso": "",
+            "valor_adquisicion": None,
+            "estado": (raw.get("estado") or "").strip() or "activo",
+            "creado_en": (raw.get("creado_en") or "").strip() or datetime.utcnow().isoformat(),
+        }
+        for k, v in list(raw.items()):
+            if v is None:
+                continue
+            key = (k or "").strip().lower()
+            mapped = header_map.get(key)
+            if mapped:
+                if mapped == "valor_adquisicion":
+                    out["valor_adquisicion"] = _to_float(v)
+                elif mapped == "fecha_ingreso":
+                    out["fecha_ingreso"] = _normalize_date(v)
+                elif mapped == "nombre" and not out["nombre"]:
+                    out["nombre"] = str(v).strip()
+                elif mapped in out:
+                    out[mapped] = str(v).strip()
+        if not out["nombre"]:
+            out["nombre"] = (raw.get("nombre") or raw.get("descripcion") or "Activo").strip()
+        yield out
 
 # =========================
 # DOCUMENTOS PDF (COMPROBANTE INGRESO, ACTA DE BAJA, REPORTE EJECUTIVO)
