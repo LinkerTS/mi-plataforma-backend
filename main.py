@@ -6,10 +6,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
 import os, sqlite3, io
-import csv
+import csv, json, math
 from io import TextIOWrapper
 from typing import Iterable
-
 
 # =========================
 # APP BASE
@@ -110,6 +109,39 @@ def ensure_activos_columns():
 # Inicializa y migra
 init_db()
 ensure_activos_columns()
+
+# ===== BLOQUE A — IA SETTINGS (guardar modelo/pesos/umbral) =====
+def ensure_settings_table():
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+
+def _get_setting(key: str, default=None):
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return row[0]
+
+def _set_setting(key: str, value):
+    val = json.dumps(value)
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, val))
+
+# Crear tabla settings
+ensure_settings_table()
 
 # =========================
 # MODELOS
@@ -338,7 +370,6 @@ def delete_asset(asset_id: int, user=Depends(require_role(["management"]))):
 # =========================
 @app.get("/export/activos.csv")
 def export_csv(user=Depends(get_current_user)):
-    import csv
     rows = fetch_export_rows()
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -374,7 +405,6 @@ def export_ping(request: Request):
 def export_csv_public(request: Request):
     check_export_key(request)
     try:
-        import csv
         rows = fetch_export_rows()
         buf = io.StringIO()
         writer = csv.writer(buf)
@@ -464,92 +494,6 @@ def _debug_seed(request: Request):
         )
     return {"ok": True, "msg": "Semilla insertada"}
 
-@app.post("/_debug/import/csv", include_in_schema=False)
-async def _debug_import_csv(request: Request):
-    """
-    Sube un CSV (form-data → file) e inserta filas en 'activos'.
-    Requiere ?key=EXPORT_API_KEY.
-    """
-    check_export_key(request)
-    form = await request.form()
-    if "file" not in form:
-        raise HTTPException(status_code=400, detail="Sube el archivo CSV en form-data con campo 'file'")
-    file = form["file"]
-    inserted = 0
-    with get_conn() as c:
-        cur = c.cursor()
-        for row in _rows_from_csv(file.file):
-            cur.execute("""
-                INSERT INTO activos
-                (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
-                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                row["nombre"], row["descripcion"], row["categoria"], row["ubicacion"],
-                row["factura"], row["proveedor"], row["tipo"], row["area_responsable"],
-                row["fecha_ingreso"], row["valor_adquisicion"], row["estado"], row["creado_en"]
-            ))
-            inserted += 1
-    return {"ok": True, "inserted": inserted}
-
-@app.post("/_debug/wipe", include_in_schema=False)
-def _debug_wipe(request: Request):
-    """Borra todos los registros de 'activos'. Requiere ?key=EXPORT_API_KEY."""
-    check_export_key(request)
-    with get_conn() as c:
-        c.execute("DELETE FROM activos")
-    return {"ok": True, "message": "Tabla 'activos' vaciada"}
-
-@app.post("/_debug/migrate", include_in_schema=False)
-def _debug_migrate(request: Request):
-    """Ejecuta la migración de columnas faltantes en 'activos'. Requiere ?key=EXPORT_API_KEY."""
-    check_export_key(request)
-    ensure_activos_columns()
-    return {"ok": True, "message": "Migración aplicada"}
-
-
-# =========================
-# ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE)
-# =========================
-@app.get("/reportes/activos")
-def reportes_activos(user=Depends(get_current_user)):
-    with get_conn() as c:
-        cur = c.cursor()
-        cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
-                              fecha_ingreso, valor_adquisicion, estado, creado_en
-                       FROM activos""")
-        rows = cur.fetchall()
-    cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
-            "fecha_ingreso","valor_adquisicion","estado","creado_en"]
-    data = [dict(zip(cols, r)) for r in rows]
-
-    total = len(data)
-    activos = sum(1 for d in data if (d["estado"] or "").lower() == "activo")
-    bajas = sum(1 for d in data if (d["estado"] or "").lower() == "baja")
-
-    por_estado, por_categoria, por_mes = {}, {}, {}
-    for d in data:
-        key_e = (d["estado"] or "desconocido").lower()
-        por_estado[key_e] = por_estado.get(key_e, 0) + 1
-        key_c = (d["categoria"] or "sin_categoria")
-        por_categoria[key_c] = por_categoria.get(key_c, 0) + 1
-        fi = (d["fecha_ingreso"] or "")
-        ym = fi[:7] if len(fi) >= 7 else "sin_fecha"
-        por_mes[ym] = por_mes.get(ym, 0) + 1
-
-    return {
-        "kpis": {
-            "total_activos": total,
-            "activos_operacionales": activos,
-            "activos_baja": bajas,
-        },
-        "agregados": {
-            "por_estado": por_estado,
-            "por_categoria": por_categoria,
-            "por_mes_ingreso": por_mes
-        },
-        "detalle": data
-    }
 # =========================
 # IMPORT CSV + WIPE + MIGRACIÓN (endpoints administrativos)
 # =========================
@@ -675,6 +619,356 @@ def _rows_from_csv(file_stream) -> Iterable[dict]:
             out["nombre"] = (raw.get("nombre") or raw.get("descripcion") or "Activo").strip()
         yield out
 
+@app.post("/_debug/import/csv", include_in_schema=False)
+async def _debug_import_csv(request: Request):
+    """
+    Sube un CSV (form-data → file) e inserta filas en 'activos'.
+    Requiere ?key=EXPORT_API_KEY.
+    """
+    check_export_key(request)
+    form = await request.form()
+    if "file" not in form:
+        raise HTTPException(status_code=400, detail="Sube el archivo CSV en form-data con campo 'file'")
+    file = form["file"]
+    inserted = 0
+    with get_conn() as c:
+        cur = c.cursor()
+        for row in _rows_from_csv(file.file):
+            cur.execute("""
+                INSERT INTO activos
+                (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
+                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                row["nombre"], row["descripcion"], row["categoria"], row["ubicacion"],
+                row["factura"], row["proveedor"], row["tipo"], row["area_responsable"],
+                row["fecha_ingreso"], row["valor_adquisicion"], row["estado"], row["creado_en"]
+            ))
+            inserted += 1
+    return {"ok": True, "inserted": inserted}
+
+@app.post("/_debug/wipe", include_in_schema=False)
+def _debug_wipe(request: Request):
+    """Borra todos los registros de 'activos'. Requiere ?key=EXPORT_API_KEY."""
+    check_export_key(request)
+    with get_conn() as c:
+        c.execute("DELETE FROM activos")
+    return {"ok": True, "message": "Tabla 'activos' vaciada"}
+
+@app.post("/_debug/migrate", include_in_schema=False)
+def _debug_migrate(request: Request):
+    """Ejecuta la migración de columnas faltantes en 'activos'. Requiere ?key=EXPORT_API_KEY."""
+    check_export_key(request)
+    ensure_activos_columns()
+    return {"ok": True, "message": "Migración aplicada"}
+
+# ===== BLOQUE B — IA HELPERS (features, reglas, regresión) =====
+def _years_since(yyyy_mm_dd: str) -> float:
+    if not yyyy_mm_dd:
+        return 0.0
+    try:
+        y, m, d = (yyyy_mm_dd[:10].split("-") + ["01","01"])[:3]
+        y = int(y); m = int(m or "1"); d = int(d or "1")
+        dt = datetime(y, m, d)
+        return max(0.0, (datetime.utcnow() - dt).days / 365.25)
+    except Exception:
+        return 0.0
+
+def _safe_float(x):
+    try:
+        return float(x) if x is not None and str(x).strip() != "" else 0.0
+    except Exception:
+        return 0.0
+
+def _norm_log1p(x: float) -> float:
+    # normaliza log(1+x) a ~[0..1] suponiendo valores hasta 1e6
+    return math.log1p(max(0.0, x)) / math.log1p(1_000_000)
+
+def _feature_vector(asset: dict) -> dict:
+    """
+    Devuelve un dict de características ESTABLES (no cambiar nombres una vez publicados).
+    """
+    valor = _safe_float(asset.get("valor_adquisicion"))
+    antig = _years_since(asset.get("fecha_ingreso") or "")
+    estado = (asset.get("estado") or "").strip().lower()
+    desc = (asset.get("descripcion") or "")
+    nombre = (asset.get("nombre") or "")
+    proveedor = (asset.get("proveedor") or "")
+    factura = (asset.get("factura") or "")
+
+    return {
+        "f_valor_log": _norm_log1p(valor),
+        "f_antiguedad_anios": min(25.0, antig) / 25.0,        # cap a 25 años
+        "f_estado_no_activo": 1.0 if estado not in ("activo", "") else 0.0,
+        "f_tiene_factura": 1.0 if factura else 0.0,
+        "f_tiene_proveedor": 1.0 if proveedor else 0.0,
+        "f_len_nombre": min(50, len(nombre)) / 50.0,
+        "f_len_desc": min(200, len(desc)) / 200.0,
+    }
+
+def _vector_to_list(feats: dict, feature_names: list) -> list:
+    return [feats.get(k, 0.0) for k in feature_names]
+
+def _sigmoid(z: float) -> float:
+    if z >= 0:
+        ez = math.exp(-z)
+        return 1.0/(1.0+ez)
+    else:
+        ez = math.exp(z)
+        return ez/(1.0+ez)
+
+def _predict_proba(weights: list, x: list) -> float:
+    # weights y x incluyen bias en x[0]=1.0
+    z = 0.0
+    for w, xi in zip(weights, x):
+        z += w * xi
+    return _sigmoid(z)
+
+def _rule_score(asset: dict) -> float:
+    """
+    Heurística por si no hay modelo entrenado.
+    """
+    score = 0.0
+    antig = _years_since(asset.get("fecha_ingreso") or "")
+    estado = (asset.get("estado") or "").strip().lower()
+    valor = _safe_float(asset.get("valor_adquisicion"))
+    if antig >= 8: score += 0.45
+    if estado in ("baja", "obsoleto", "averiado"): score += 0.45
+    if valor <= 500: score += 0.15
+    return min(1.0, score)
+
+def _get_ai_threshold_default() -> float:
+    return float(_get_setting("AI_THRESHOLD_CRITICAL", 0.5))
+
+def _load_model():
+    weights = _get_setting("AI_LOGREG_WEIGHTS", None)  # list de floats, incluye bias
+    feats = _get_setting("AI_FEATURE_NAMES", None)     # orden de features (sin bias)
+    thr = float(_get_setting("AI_THRESHOLD_CRITICAL", 0.5))
+    return weights, feats, thr
+
+# ===== BLOQUE C — IA ENDPOINTS (labels, train, predict, ver modelo) =====
+class TrainRequest(BaseModel):
+    epochs: Optional[int] = 300
+    lr: Optional[float] = 0.05
+    l2: Optional[float] = 0.001
+    threshold: Optional[float] = None  # si no, mantiene o 0.5
+
+class LabelBody(BaseModel):
+    label: int  # 0 = ok, 1 = critico
+
+@app.post("/ia/labels/{asset_id}")
+def ia_add_label(asset_id: int, body: LabelBody, user=Depends(require_role(["supervisor","management"]))):
+    if body.label not in (0,1):
+        raise HTTPException(400, "label debe ser 0 o 1")
+    # validamos que exista el activo
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("SELECT id FROM activos WHERE id=?", (asset_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Activo no encontrado")
+        cur.execute("""INSERT INTO ml_labels (asset_id,label,timestamp) 
+                       VALUES(?,?,?)""", (asset_id, body.label, datetime.utcnow().isoformat()))
+    return {"ok": True, "asset_id": asset_id, "label": body.label}
+
+@app.post("/ia/train")
+def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","management"]))):
+    # 1) Cargar dataset etiquetado
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""
+            SELECT a.id, a.nombre, a.descripcion, a.categoria, a.ubicacion, a.factura, a.proveedor,
+                   a.tipo, a.area_responsable, a.fecha_ingreso, a.valor_adquisicion, a.estado, a.creado_en,
+                   l.label
+            FROM ml_labels l
+            JOIN activos a ON a.id = l.asset_id
+        """)
+        rows = cur.fetchall()
+
+    if not rows:
+        raise HTTPException(400, "No hay etiquetas en ml_labels. Crea algunas con /ia/labels/{id}")
+
+    cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
+            "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en","label"]
+
+    dataset = [dict(zip(cols, r)) for r in rows]
+
+    # 2) Construir features y y
+    feature_names = ["f_valor_log","f_antiguedad_anios","f_estado_no_activo",
+                     "f_tiene_factura","f_tiene_proveedor","f_len_nombre","f_len_desc"]
+
+    X = []
+    y = []
+    for d in dataset:
+        feats = _feature_vector(d)
+        X.append([1.0] + _vector_to_list(feats, feature_names))  # bias
+        y.append(int(d["label"]))
+
+    n, m = len(X), len(X[0])  # n muestras, m features (incl. bias)
+    # 3) Entrenar regresión logística con GD
+    w = [0.0]*m
+    lr = float(req.lr or 0.05)
+    l2 = float(req.l2 or 0.001)
+    epochs = int(req.epochs or 300)
+
+    for _ in range(epochs):
+        grad = [0.0]*m
+        for xi, yi in zip(X, y):
+            p = _predict_proba(w, xi)
+            err = p - yi
+            for j in range(m):
+                grad[j] += err * xi[j]
+        # regularización L2 (no penalizar bias j=0)
+        for j in range(1, m):
+            grad[j] += l2 * w[j]
+        for j in range(m):
+            w[j] -= (lr / n) * grad[j]
+
+    # 4) Métricas rápidas
+    tp=fp=tn=fn=0
+    thr = float(req.threshold) if req.threshold is not None else _get_ai_threshold_default()
+    for xi, yi in zip(X, y):
+        p = _predict_proba(w, xi)
+        yhat = 1 if p >= thr else 0
+        if yi==1 and yhat==1: tp+=1
+        elif yi==0 and yhat==1: fp+=1
+        elif yi==0 and yhat==0: tn+=1
+        elif yi==1 and yhat==0: fn+=1
+    acc = (tp+tn)/max(1,(tp+tn+fp+fn))
+    prec = tp/max(1,(tp+fp))
+    rec = tp/max(1,(tp+fn))
+    f1 = 2*prec*rec/max(1e-9,(prec+rec))
+
+    # 5) Guardar modelo
+    _set_setting("AI_LOGREG_WEIGHTS", w)
+    _set_setting("AI_FEATURE_NAMES", feature_names)
+    _set_setting("AI_THRESHOLD_CRITICAL", thr)
+
+    return {
+        "ok": True,
+        "samples": n,
+        "features": feature_names,
+        "weights_len": len(w),
+        "threshold_usado": thr,
+        "metrics": {"acc": acc, "prec": prec, "rec": rec, "f1": f1}
+    }
+
+@app.get("/ia/model")
+def ia_model(user=Depends(require_role(["supervisor","management"]))):
+    w, feats, thr = _load_model()
+    return {
+        "has_model": bool(w and feats),
+        "feature_names": feats or [],
+        "weights": w or [],
+        "threshold": thr
+    }
+
+@app.get("/ia/predict/{asset_id}")
+def ia_predict(asset_id: int, user=Depends(get_current_user)):
+    # cargar activo
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
+                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
+                       FROM activos WHERE id=?""", (asset_id,))
+        r = cur.fetchone()
+    if not r:
+        raise HTTPException(404, "Activo no encontrado")
+    cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
+            "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en"]
+    a = dict(zip(cols, r))
+
+    w, feats, thr = _load_model()
+    if w and feats:
+        x = [1.0] + _vector_to_list(_feature_vector(a), feats)
+        proba = _predict_proba(w, x)
+        pred = 1 if proba >= thr else 0
+        src = "model"
+    else:
+        proba = _rule_score(a)
+        pred = 1 if proba >= _get_ai_threshold_default() else 0
+        src = "rules"
+
+    return {
+        "asset_id": asset_id,
+        "proba_critico": proba,
+        "threshold": thr if src=="model" else _get_ai_threshold_default(),
+        "pred_label": pred,
+        "source": src
+    }
+
+# =========================
+# ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE) — BLOQUE D con IA opcional
+# =========================
+@app.get("/reportes/activos")
+def reportes_activos(
+    include_ia: int = 0,
+    include_ia_model: int = 0,
+    user=Depends(get_current_user)
+):
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
+                              fecha_ingreso, valor_adquisicion, estado, creado_en, descripcion, factura, proveedor
+                       FROM activos""")
+        rows = cur.fetchall()
+    cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
+            "fecha_ingreso","valor_adquisicion","estado","creado_en","descripcion","factura","proveedor"]
+    data = [dict(zip(cols, r)) for r in rows]
+
+    # IA opcional
+    attach_ia = (include_ia or include_ia_model)
+    w, feats, thr = _load_model()
+    use_model = bool(w and feats) if include_ia_model else False
+
+    if attach_ia:
+        for d in data:
+            if use_model:
+                x = [1.0] + _vector_to_list(_feature_vector(d), feats)
+                p = _predict_proba(w, x)
+                t = thr
+                src = "model"
+            else:
+                p = _rule_score(d)
+                t = _get_ai_threshold_default()
+                src = "rules"
+            d["ia_score"] = p
+            d["ia_label"] = 1 if p >= t else 0
+            d["ia_source"] = src
+
+    total = len(data)
+    activos = sum(1 for d in data if (d["estado"] or "").lower() == "activo")
+    bajas = sum(1 for d in data if (d["estado"] or "").lower() == "baja")
+
+    por_estado, por_categoria, por_mes = {}, {}, {}
+    for d in data:
+        key_e = (d["estado"] or "desconocido").lower()
+        por_estado[key_e] = por_estado.get(key_e, 0) + 1
+        key_c = (d["categoria"] or "sin_categoria")
+        por_categoria[key_c] = por_categoria.get(key_c, 0) + 1
+        fi = (d["fecha_ingreso"] or "")
+        ym = fi[:7] if len(fi) >= 7 else "sin_fecha"
+        por_mes[ym] = por_mes.get(ym, 0) + 1
+
+    # Limpiar extras no usados en payload base
+    for d in data:
+        d.pop("descripcion", None)
+        d.pop("factura", None)
+        d.pop("proveedor", None)
+
+    return {
+        "kpis": {
+            "total_activos": total,
+            "activos_operacionales": activos,
+            "activos_baja": bajas,
+        },
+        "agregados": {
+            "por_estado": por_estado,
+            "por_categoria": por_categoria,
+            "por_mes_ingreso": por_mes
+        },
+        "detalle": data
+    }
+
 # =========================
 # DOCUMENTOS PDF (COMPROBANTE INGRESO, ACTA DE BAJA, REPORTE EJECUTIVO)
 # =========================
@@ -761,7 +1055,7 @@ def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervi
 
 @app.get("/reportes/instantaneo.pdf")
 def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
-    rep = reportes_activos(user)  # reutiliza el endpoint optimizado
+    rep = reportes_activos(user=user)  # reutiliza el endpoint optimizado (sin IA por defecto)
     k = rep["kpis"]; agg = rep["agregados"]
 
     hoy = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -792,3 +1086,4 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
 # =========================
 # FIN
 # =========================
+
