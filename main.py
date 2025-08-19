@@ -832,13 +832,13 @@ class LabelBody(BaseModel):
 @app.post("/ia/labels/{asset_id}")
 def ia_add_label(asset_id: int, body: LabelBody, user=Depends(require_role(["supervisor","management"]))):
     if body.label not in (0,1):
-        raise HTTPException(400, "label debe ser 0 o 1")
+        raise HTTPException(status_code=400, detail="label debe ser 0 o 1")
     # validamos que exista el activo
     with get_conn() as c:
         cur = c.cursor()
         cur.execute("SELECT id FROM activos WHERE id=?", (asset_id,))
         if not cur.fetchone():
-            raise HTTPException(404, "Activo no encontrado")
+            raise HTTPException(status_code=404, detail="Activo no encontrado")
         cur.execute("""INSERT INTO ml_labels (asset_id,label,timestamp) 
                        VALUES(?,?,?)""", (asset_id, body.label, datetime.utcnow().isoformat()))
     return {"ok": True, "asset_id": asset_id, "label": body.label}
@@ -858,7 +858,7 @@ def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","managem
         rows = cur.fetchall()
 
     if not rows:
-        raise HTTPException(400, "No hay etiquetas en ml_labels. Crea algunas con /ia/labels/{id}")
+        raise HTTPException(status_code=400, detail="No hay etiquetas en ml_labels. Crea algunas con /ia/labels/{id}")
 
     cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
             "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en","label"]
@@ -942,7 +942,7 @@ def ia_model(user=Depends(require_role(["supervisor","management"]))):
 def ia_persist_save(user=Depends(require_role(["supervisor","management"]))):
     w, feats, thr = _load_model()
     if not (w and feats):
-        raise HTTPException(400, "No hay modelo en DB para guardar")
+        raise HTTPException(status_code=400, detail="No hay modelo en DB para guardar")
     ok = _save_model_file(w, feats, thr)
     return {"ok": bool(ok), "path": MODEL_PATH}
 
@@ -950,7 +950,7 @@ def ia_persist_save(user=Depends(require_role(["supervisor","management"]))):
 def ia_persist_load(user=Depends(require_role(["supervisor","management"]))):
     w_f, f_f, t_f = _load_model_file()
     if not (w_f and f_f):
-        raise HTTPException(400, "No se encontró modelo.pkl válido")
+        raise HTTPException(status_code=400, detail="No se encontró modelo.pkl válido")
     _set_setting("AI_LOGREG_WEIGHTS", w_f)
     _set_setting("AI_FEATURE_NAMES", f_f)
     _set_setting("AI_THRESHOLD_CRITICAL", float(t_f if t_f is not None else 0.5))
@@ -966,7 +966,7 @@ def ia_predict(asset_id: int, user=Depends(get_current_user)):
                        FROM activos WHERE id=?""", (asset_id,))
         r = cur.fetchone()
     if not r:
-        raise HTTPException(404, "Activo no encontrado")
+        raise HTTPException(status_code=404, detail="Activo no encontrado")
     cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
             "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en"]
     a = dict(zip(cols, r))
@@ -1077,7 +1077,7 @@ def _fetch_asset(asset_id: int):
                        FROM activos WHERE id=?""", (asset_id,))
         r = cur.fetchone()
     if not r:
-        raise HTTPException(status_code=404, "Activo no encontrado")
+        raise HTTPException(status_code=404, detail="Activo no encontrado")
     cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
             "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en"]
     return dict(zip(cols, r))
@@ -1180,5 +1180,6 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
 # =========================
 # FIN
 # =========================
+
 
 
