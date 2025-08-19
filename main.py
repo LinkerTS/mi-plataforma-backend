@@ -9,6 +9,7 @@ import os, sqlite3, io
 import csv, json, math
 from io import TextIOWrapper
 from typing import Iterable
+import joblib  # <-- NUEVO: para guardar/cargar el modelo a archivo
 
 # =========================
 # APP BASE
@@ -142,6 +143,78 @@ def _set_setting(key: str, value):
 
 # Crear tabla settings
 ensure_settings_table()
+
+# ===== Persistencia a archivo del modelo (NUEVO) =====
+MODEL_PATH = os.getenv("MODEL_PATH", "modelo.pkl")
+
+def _save_model_file(weights: list, features: list, threshold: float):
+    """
+    Guarda una copia del modelo en archivo. La DB 'settings' sigue siendo la fuente de verdad.
+    """
+    payload = {
+        "weights": weights,       # incluye bias en weights[0]
+        "features": features,     # orden de features (sin bias)
+        "threshold": float(threshold),
+        "version": APP_VERSION,
+        "saved_at": datetime.utcnow().isoformat(),
+        "algo": "logreg-gd",
+    }
+    try:
+        joblib.dump(payload, MODEL_PATH)
+        return True
+    except Exception as e:
+        print("WARN: no se pudo guardar modelo.pkl:", repr(e))
+        return False
+
+def _load_model_file():
+    """
+    Carga el modelo desde archivo si existe. Devuelve (weights, features, threshold) o (None,None,None).
+    """
+    try:
+        if not os.path.exists(MODEL_PATH):
+            return None, None, None
+        payload = joblib.load(MODEL_PATH)
+        return payload.get("weights"), payload.get("features"), float(payload.get("threshold", 0.5))
+    except Exception as e:
+        print("WARN: no se pudo cargar modelo.pkl:", repr(e))
+        return None, None, None
+
+def _sync_model_persistence():
+    """
+    Sincroniza DB <-> archivo al iniciar:
+      - Si hay archivo y DB vacía -> importar a DB.
+      - Si hay DB y no hay archivo -> crear archivo.
+      - Si hay ambos -> no-op (DB es la fuente de verdad).
+    """
+    w_db = _get_setting("AI_LOGREG_WEIGHTS", None)
+    f_db = _get_setting("AI_FEATURE_NAMES", None)
+    t_db = _get_setting("AI_THRESHOLD_CRITICAL", None)
+
+    w_f, f_f, t_f = _load_model_file()
+
+    # Caso 1: archivo existe y DB está vacía -> importar a DB
+    if (w_f and f_f) and not (w_db and f_db):
+        _set_setting("AI_LOGREG_WEIGHTS", w_f)
+        _set_setting("AI_FEATURE_NAMES", f_f)
+        _set_setting("AI_THRESHOLD_CRITICAL", float(t_f if t_f is not None else 0.5))
+        print("SYNC: importado modelo desde archivo -> DB")
+        return
+
+    # Caso 2: DB existe y archivo falta -> exportar a archivo
+    if (w_db and f_db) and not (w_f and f_f):
+        _save_model_file(w_db, f_db, float(t_db if t_db is not None else 0.5))
+        print("SYNC: exportado modelo desde DB -> archivo")
+        return
+
+    # Caso 3: ambos presentes -> no-op
+    print("SYNC: modelo presente en DB (y archivo opcional)")
+
+@app.on_event("startup")
+def _startup_model_sync():
+    try:
+        _sync_model_persistence()
+    except Exception as e:
+        print("WARN startup sync:", repr(e))
 
 # =========================
 # MODELOS
@@ -444,7 +517,7 @@ def _debug_routes():
     try:
         return {"routes": [getattr(r, "path", str(r)) for r in app.routes]}
     except Exception as e:
-        return {"ok": False, "err": type(e).__name__, "msg": str(e)}
+        return {"ok": False, "err": type(e)._name_, "msg": str(e)}
 
 @app.get("/_debug/export/check", include_in_schema=False)
 def _debug_export_check():
@@ -463,7 +536,7 @@ def _debug_export_check():
         import traceback
         return {
             "ok": False,
-            "error_type": type(e).__name__,
+            "error_type": type(e)._name_,
             "error_msg": str(e),
             "trace": traceback.format_exc().splitlines()[-8:],
         }
@@ -843,6 +916,8 @@ def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","managem
     _set_setting("AI_FEATURE_NAMES", feature_names)
     _set_setting("AI_THRESHOLD_CRITICAL", thr)
 
+    _save_model_file(w, feature_names, thr)  # <-- NUEVO: copia best-effort a archivo
+
     return {
         "ok": True,
         "samples": n,
@@ -861,6 +936,25 @@ def ia_model(user=Depends(require_role(["supervisor","management"]))):
         "weights": w or [],
         "threshold": thr
     }
+
+# ===== NUEVO: endpoints opcionales para forzar guardar/cargar el archivo del modelo =====
+@app.post("/ia/persist/save")
+def ia_persist_save(user=Depends(require_role(["supervisor","management"]))):
+    w, feats, thr = _load_model()
+    if not (w and feats):
+        raise HTTPException(400, "No hay modelo en DB para guardar")
+    ok = _save_model_file(w, feats, thr)
+    return {"ok": bool(ok), "path": MODEL_PATH}
+
+@app.post("/ia/persist/load")
+def ia_persist_load(user=Depends(require_role(["supervisor","management"]))):
+    w_f, f_f, t_f = _load_model_file()
+    if not (w_f and f_f):
+        raise HTTPException(400, "No se encontró modelo.pkl válido")
+    _set_setting("AI_LOGREG_WEIGHTS", w_f)
+    _set_setting("AI_FEATURE_NAMES", f_f)
+    _set_setting("AI_THRESHOLD_CRITICAL", float(t_f if t_f is not None else 0.5))
+    return {"ok": True, "imported_from_file": True}
 
 @app.get("/ia/predict/{asset_id}")
 def ia_predict(asset_id: int, user=Depends(get_current_user)):
@@ -983,7 +1077,7 @@ def _fetch_asset(asset_id: int):
                        FROM activos WHERE id=?""", (asset_id,))
         r = cur.fetchone()
     if not r:
-        raise HTTPException(status_code=404, detail="Activo no encontrado")
+        raise HTTPException(status_code=404, "Activo no encontrado")
     cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
             "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en"]
     return dict(zip(cols, r))
@@ -1086,4 +1180,5 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
 # =========================
 # FIN
 # =========================
+
 
