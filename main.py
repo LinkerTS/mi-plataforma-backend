@@ -1180,6 +1180,3 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
 # =========================
 # FIN
 # =========================
-
-
-
