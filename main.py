@@ -9,7 +9,8 @@ import os, sqlite3, io
 import csv, json, math
 from io import TextIOWrapper
 from typing import Iterable
-import joblib  # <-- NUEVO: para guardar/cargar el modelo a archivo
+import joblib  # <-- para guardar/cargar el modelo a archivo
+import shutil  # <-- NUEVO: para migrar archivos a /data
 
 # =========================
 # APP BASE
@@ -29,10 +30,51 @@ app.add_middleware(
 )
 
 # =========================
+# RUTAS PERSISTENTES (DB y MODELO) + MIGRACIÓN A /data
+# =========================
+# Si tienes disco montado en /data (Render "Disks"), usamos allí por defecto.
+DEFAULT_DB_FILE = "activos.db"
+DEFAULT_MODEL_FILE = "modelo.pkl"
+
+def _in_data_dir() -> bool:
+    # Render monta el disco en /data. Si existe, lo usamos como preferencia.
+    return os.path.isdir("/data")
+
+# Lee variables de entorno, y si no hay, cae a /data/... si existe el disco; si no, a archivos locales.
+DB_NAME = os.getenv("DB_NAME", f"/data/{DEFAULT_DB_FILE}" if _in_data_dir() else DEFAULT_DB_FILE)
+MODEL_PATH = os.getenv("MODEL_PATH", f"/data/{DEFAULT_MODEL_FILE}" if _in_data_dir() else DEFAULT_MODEL_FILE)
+
+def _ensure_parent(path: str):
+    parent = os.path.dirname(path)
+    if parent and parent != "":
+        os.makedirs(parent, exist_ok=True)
+
+def _maybe_migrate_to_data(src_name: str, dest_path: str):
+    """
+    Si el destino está en /data, y no existe, pero sí existe el archivo en el
+    directorio de trabajo (src_name), lo copiamos una vez.
+    """
+    try:
+        if dest_path.startswith("/data/"):
+            _ensure_parent(dest_path)
+            if (not os.path.exists(dest_path)) and os.path.exists(src_name):
+                shutil.copy2(src_name, dest_path)
+                print(f"MIGRATE: copiado {src_name} -> {dest_path}")
+    except Exception as e:
+        print("WARN migrate:", src_name, "->", dest_path, repr(e))
+
+def _preflight_persistence():
+    # Migrar DB si aplica
+    _maybe_migrate_to_data(os.path.basename(DB_NAME) or DEFAULT_DB_FILE, DB_NAME)
+    # Migrar modelo si aplica
+    _maybe_migrate_to_data(os.path.basename(MODEL_PATH) or DEFAULT_MODEL_FILE, MODEL_PATH)
+
+# Ejecutamos la pre-migración antes de abrir la DB
+_preflight_persistence()
+
+# =========================
 # DB
 # =========================
-DB_NAME = os.getenv("DB_NAME", "activos.db")
-
 def get_conn():
     # SQLite seguro para uso en servicio web (autocommit + WAL)
     conn = sqlite3.connect(DB_NAME, check_same_thread=False, isolation_level=None)
@@ -144,9 +186,7 @@ def _set_setting(key: str, value):
 # Crear tabla settings
 ensure_settings_table()
 
-# ===== Persistencia a archivo del modelo (NUEVO) =====
-MODEL_PATH = os.getenv("MODEL_PATH", "modelo.pkl")
-
+# ===== Persistencia a archivo del modelo =====
 def _save_model_file(weights: list, features: list, threshold: float):
     """
     Guarda una copia del modelo en archivo. La DB 'settings' sigue siendo la fuente de verdad.
@@ -160,6 +200,7 @@ def _save_model_file(weights: list, features: list, threshold: float):
         "algo": "logreg-gd",
     }
     try:
+        _ensure_parent(MODEL_PATH)
         joblib.dump(payload, MODEL_PATH)
         return True
     except Exception as e:
@@ -517,7 +558,7 @@ def _debug_routes():
     try:
         return {"routes": [getattr(r, "path", str(r)) for r in app.routes]}
     except Exception as e:
-        return {"ok": False, "err": type(e)._name_, "msg": str(e)}
+        return {"ok": False, "err": type(e).__name__, "msg": str(e)}
 
 @app.get("/_debug/export/check", include_in_schema=False)
 def _debug_export_check():
@@ -536,7 +577,7 @@ def _debug_export_check():
         import traceback
         return {
             "ok": False,
-            "error_type": type(e)._name_,
+            "error_type": type(e).__name__,
             "error_msg": str(e),
             "trace": traceback.format_exc().splitlines()[-8:],
         }
@@ -916,7 +957,7 @@ def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","managem
     _set_setting("AI_FEATURE_NAMES", feature_names)
     _set_setting("AI_THRESHOLD_CRITICAL", thr)
 
-    _save_model_file(w, feature_names, thr)  # <-- NUEVO: copia best-effort a archivo
+    _save_model_file(w, feature_names, thr)  # copia best-effort a archivo
 
     return {
         "ok": True,
@@ -937,7 +978,7 @@ def ia_model(user=Depends(require_role(["supervisor","management"]))):
         "threshold": thr
     }
 
-# ===== NUEVO: endpoints opcionales para forzar guardar/cargar el archivo del modelo =====
+# ===== Endpoints para forzar guardar/cargar el archivo del modelo =====
 @app.post("/ia/persist/save")
 def ia_persist_save(user=Depends(require_role(["supervisor","management"]))):
     w, feats, thr = _load_model()
@@ -991,7 +1032,7 @@ def ia_predict(asset_id: int, user=Depends(get_current_user)):
     }
 
 # =========================
-# ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE) — BLOQUE D con IA opcional
+# ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE)
 # =========================
 @app.get("/reportes/activos")
 def reportes_activos(
