@@ -15,19 +15,28 @@ import shutil  # <-- para migrar archivos a /data
 # =========================
 # APP BASE
 # =========================
-APP_VERSION = "1.3.5"  # subimos patch por el agregado de depreciación
+APP_VERSION = "1.3.5"
 app = FastAPI(title="API Gestión de Activos", version=APP_VERSION)
 
-# CORS desde variables de entorno (por defecto "*")
+# -------- CORS (soporta previews de Lovable) --------
+# ORIGINS: lista explícita separada por comas (localhost, tu backend, tu front oficial si lo tienes)
 origins_env = os.getenv("ORIGINS", "*")
 ORIGINS = [""] if origins_env.strip() == "" else [o.strip() for o in origins_env.split(",") if o.strip()]
+
+# ORIGINS_REGEX: acepta cualquier subdominio de Lovable (*.lovable.page)
+# puedes sobreescribirlo por env si quieres restringir más
+ORIGINS_REGEX = os.getenv("ORIGINS_REGEX", r"https://.*\.lovable\.page$")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
+    allow_origin_regex=ORIGINS_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# ----------------------------------------------------
+
 
 # =========================
 # RUTAS PERSISTENTES (DB y MODELO) + MIGRACIÓN A /data
