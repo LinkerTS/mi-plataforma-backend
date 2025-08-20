@@ -1,21 +1,21 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import os, sqlite3, io
 import csv, json, math
 from io import TextIOWrapper
 from typing import Iterable
 import joblib  # <-- para guardar/cargar el modelo a archivo
-import shutil  # <-- NUEVO: para migrar archivos a /data
+import shutil  # <-- para migrar archivos a /data
 
 # =========================
 # APP BASE
 # =========================
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"  # subimos patch por el agregado de depreciación
 app = FastAPI(title="API Gestión de Activos", version=APP_VERSION)
 
 # CORS desde variables de entorno (por defecto "*")
@@ -32,15 +32,12 @@ app.add_middleware(
 # =========================
 # RUTAS PERSISTENTES (DB y MODELO) + MIGRACIÓN A /data
 # =========================
-# Si tienes disco montado en /data (Render "Disks"), usamos allí por defecto.
 DEFAULT_DB_FILE = "activos.db"
 DEFAULT_MODEL_FILE = "modelo.pkl"
 
 def _in_data_dir() -> bool:
-    # Render monta el disco en /data. Si existe, lo usamos como preferencia.
     return os.path.isdir("/data")
 
-# Lee variables de entorno, y si no hay, cae a /data/... si existe el disco; si no, a archivos locales.
 DB_NAME = os.getenv("DB_NAME", f"/data/{DEFAULT_DB_FILE}" if _in_data_dir() else DEFAULT_DB_FILE)
 MODEL_PATH = os.getenv("MODEL_PATH", f"/data/{DEFAULT_MODEL_FILE}" if _in_data_dir() else DEFAULT_MODEL_FILE)
 
@@ -50,10 +47,6 @@ def _ensure_parent(path: str):
         os.makedirs(parent, exist_ok=True)
 
 def _maybe_migrate_to_data(src_name: str, dest_path: str):
-    """
-    Si el destino está en /data, y no existe, pero sí existe el archivo en el
-    directorio de trabajo (src_name), lo copiamos una vez.
-    """
     try:
         if dest_path.startswith("/data/"):
             _ensure_parent(dest_path)
@@ -64,19 +57,15 @@ def _maybe_migrate_to_data(src_name: str, dest_path: str):
         print("WARN migrate:", src_name, "->", dest_path, repr(e))
 
 def _preflight_persistence():
-    # Migrar DB si aplica
     _maybe_migrate_to_data(os.path.basename(DB_NAME) or DEFAULT_DB_FILE, DB_NAME)
-    # Migrar modelo si aplica
     _maybe_migrate_to_data(os.path.basename(MODEL_PATH) or DEFAULT_MODEL_FILE, MODEL_PATH)
 
-# Ejecutamos la pre-migración antes de abrir la DB
 _preflight_persistence()
 
 # =========================
 # DB
 # =========================
 def get_conn():
-    # SQLite seguro para uso en servicio web (autocommit + WAL)
     conn = sqlite3.connect(DB_NAME, check_same_thread=False, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
@@ -84,7 +73,7 @@ def get_conn():
 def init_db():
     with get_conn() as c:
         cur = c.cursor()
-        # Tabla de activos
+        # Tabla de activos (agregamos vida útil y método de depreciación)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS activos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +88,9 @@ def init_db():
             fecha_ingreso TEXT,
             valor_adquisicion REAL,
             estado TEXT,
-            creado_en TEXT
+            creado_en TEXT,
+            vida_util_anios REAL DEFAULT 5.0,
+            metodo_depreciacion TEXT DEFAULT 'linea_recta'
         )
         """)
         # Tabla de usuarios (auth)
@@ -116,17 +107,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ml_labels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             asset_id INTEGER NOT NULL,
-            label INTEGER NOT NULL,        -- 1: crítico/obsoleto, 0: ok
+            label INTEGER NOT NULL,
             timestamp TEXT NOT NULL,
             FOREIGN KEY(asset_id) REFERENCES activos(id)
         )
         """)
 
-# --- Migración automática: agrega columnas faltantes en 'activos' si la DB es vieja ---
 def ensure_activos_columns():
     """
     Migra la tabla 'activos' si faltan columnas de versiones anteriores.
-    No borra datos; solo agrega columnas faltantes con valores NULL.
     """
     needed = {
         "descripcion": "TEXT",
@@ -140,6 +129,9 @@ def ensure_activos_columns():
         "valor_adquisicion": "REAL",
         "estado": "TEXT",
         "creado_en": "TEXT",
+        # Nuevos para depreciación:
+        "vida_util_anios": "REAL DEFAULT 5.0",
+        "metodo_depreciacion": "TEXT DEFAULT 'linea_recta'",
     }
     with get_conn() as c:
         cur = c.cursor()
@@ -183,17 +175,13 @@ def _set_setting(key: str, value):
         cur.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, val))
 
-# Crear tabla settings
 ensure_settings_table()
 
 # ===== Persistencia a archivo del modelo =====
 def _save_model_file(weights: list, features: list, threshold: float):
-    """
-    Guarda una copia del modelo en archivo. La DB 'settings' sigue siendo la fuente de verdad.
-    """
     payload = {
-        "weights": weights,       # incluye bias en weights[0]
-        "features": features,     # orden de features (sin bias)
+        "weights": weights,
+        "features": features,
         "threshold": float(threshold),
         "version": APP_VERSION,
         "saved_at": datetime.utcnow().isoformat(),
@@ -208,9 +196,6 @@ def _save_model_file(weights: list, features: list, threshold: float):
         return False
 
 def _load_model_file():
-    """
-    Carga el modelo desde archivo si existe. Devuelve (weights, features, threshold) o (None,None,None).
-    """
     try:
         if not os.path.exists(MODEL_PATH):
             return None, None, None
@@ -221,19 +206,12 @@ def _load_model_file():
         return None, None, None
 
 def _sync_model_persistence():
-    """
-    Sincroniza DB <-> archivo al iniciar:
-      - Si hay archivo y DB vacía -> importar a DB.
-      - Si hay DB y no hay archivo -> crear archivo.
-      - Si hay ambos -> no-op (DB es la fuente de verdad).
-    """
     w_db = _get_setting("AI_LOGREG_WEIGHTS", None)
     f_db = _get_setting("AI_FEATURE_NAMES", None)
     t_db = _get_setting("AI_THRESHOLD_CRITICAL", None)
 
     w_f, f_f, t_f = _load_model_file()
 
-    # Caso 1: archivo existe y DB está vacía -> importar a DB
     if (w_f and f_f) and not (w_db and f_db):
         _set_setting("AI_LOGREG_WEIGHTS", w_f)
         _set_setting("AI_FEATURE_NAMES", f_f)
@@ -241,13 +219,11 @@ def _sync_model_persistence():
         print("SYNC: importado modelo desde archivo -> DB")
         return
 
-    # Caso 2: DB existe y archivo falta -> exportar a archivo
     if (w_db and f_db) and not (w_f and f_f):
         _save_model_file(w_db, f_db, float(t_db if t_db is not None else 0.5))
         print("SYNC: exportado modelo desde DB -> archivo")
         return
 
-    # Caso 3: ambos presentes -> no-op
     print("SYNC: modelo presente en DB (y archivo opcional)")
 
 @app.on_event("startup")
@@ -258,7 +234,7 @@ def _startup_model_sync():
         print("WARN startup sync:", repr(e))
 
 # =========================
-# MODELOS
+# MODELOS (Pydantic)
 # =========================
 class AssetCreate(BaseModel):
     nombre: str
@@ -272,6 +248,9 @@ class AssetCreate(BaseModel):
     fecha_ingreso: Optional[str] = ""  # "YYYY-MM-DD"
     valor_adquisicion: Optional[float] = None
     estado: Optional[str] = "activo"
+    # Nuevos campos (opcionales; por defecto no rompen nada):
+    vida_util_anios: Optional[float] = 5.0
+    metodo_depreciacion: Optional[str] = "linea_recta"
 
 class AssetOut(BaseModel):
     id: int
@@ -287,6 +266,9 @@ class AssetOut(BaseModel):
     valor_adquisicion: Optional[float]
     estado: Optional[str]
     creado_en: str
+    # Nuevos:
+    vida_util_anios: Optional[float]
+    metodo_depreciacion: Optional[str]
 
 class AssetUpdate(BaseModel):
     nombre: Optional[str]
@@ -300,17 +282,20 @@ class AssetUpdate(BaseModel):
     fecha_ingreso: Optional[str]
     valor_adquisicion: Optional[float]
     estado: Optional[str]
+    # Nuevos:
+    vida_util_anios: Optional[float]
+    metodo_depreciacion: Optional[str]
 
 class UserCreate(BaseModel):
     email: str
     password: str
-    role: Optional[str] = None  # si no se envía, asignamos por dominio
+    role: Optional[str] = None
 
 class BajaRequest(BaseModel):
     motivo: str
 
 # =========================
-# AUTH + ROLES (JWT)  -> PBKDF2 en lugar de bcrypt
+# AUTH + ROLES (JWT)
 # =========================
 from passlib.hash import pbkdf2_sha256 as hasher
 import jwt
@@ -319,7 +304,6 @@ JWT_SECRET = os.getenv("JWT_SECRET", "devsecret-change-me")
 ALGORITHM = "HS256"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-# Mapea dominios de correo -> rol por defecto
 DOMAIN_ROLE_MAP = {
     "tecnica.com": "technical",
     "bodega.com": "storekeeper",
@@ -412,34 +396,38 @@ def fetch_export_rows():
 def root():
     return {"message": "API de gestión de activos funcionando", "version": APP_VERSION}
 
+# Incluir nuevas columnas en los SELECT para no romper el response_model
+_COMMON_SELECT = """SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
+                           tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+                           vida_util_anios, metodo_depreciacion
+                    FROM activos"""
+
 @app.get("/activos", response_model=List[AssetOut])
 def get_assets(user=Depends(get_current_user)):
     with get_conn() as c:
         cur = c.cursor()
-        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
-                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
-                       FROM activos ORDER BY id DESC""")
+        cur.execute(_COMMON_SELECT + " ORDER BY id DESC")
         rows = cur.fetchall()
     return [AssetOut(
         id=r[0], nombre=r[1], descripcion=r[2], categoria=r[3], ubicacion=r[4],
         factura=r[5], proveedor=r[6], tipo=r[7], area_responsable=r[8],
-        fecha_ingreso=r[9], valor_adquisicion=r[10], estado=r[11], creado_en=r[12]
+        fecha_ingreso=r[9], valor_adquisicion=r[10], estado=r[11], creado_en=r[12],
+        vida_util_anios=r[13], metodo_depreciacion=r[14]
     ) for r in rows]
 
 @app.get("/activos/{asset_id}", response_model=AssetOut)
 def get_asset(asset_id: int, user=Depends(get_current_user)):
     with get_conn() as c:
         cur = c.cursor()
-        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
-                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
-                       FROM activos WHERE id=?""", (asset_id,))
+        cur.execute(_COMMON_SELECT + " WHERE id=?", (asset_id,))
         r = cur.fetchone()
     if not r:
         raise HTTPException(status_code=404, detail="Activo no encontrado")
     return AssetOut(
         id=r[0], nombre=r[1], descripcion=r[2], categoria=r[3], ubicacion=r[4],
         factura=r[5], proveedor=r[6], tipo=r[7], area_responsable=r[8],
-        fecha_ingreso=r[9], valor_adquisicion=r[10], estado=r[11], creado_en=r[12]
+        fecha_ingreso=r[9], valor_adquisicion=r[10], estado=r[11], creado_en=r[12],
+        vida_util_anios=r[13], metodo_depreciacion=r[14]
     )
 
 @app.post("/activos", response_model=AssetOut, status_code=201)
@@ -449,10 +437,14 @@ def create_asset(asset: AssetCreate, user=Depends(require_role(["storekeeper","s
         cur = c.cursor()
         cur.execute("""
             INSERT INTO activos (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
-                                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (asset.nombre, asset.descripcion, asset.categoria, asset.ubicacion, asset.factura, asset.proveedor,
-              asset.tipo, asset.area_responsable, asset.fecha_ingreso, asset.valor_adquisicion, asset.estado, creado_en))
+                                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+                                 vida_util_anios, metodo_depreciacion)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            asset.nombre, asset.descripcion, asset.categoria, asset.ubicacion, asset.factura, asset.proveedor,
+            asset.tipo, asset.area_responsable, asset.fecha_ingreso, asset.valor_adquisicion, asset.estado, creado_en,
+            asset.vida_util_anios, asset.metodo_depreciacion
+        ))
         new_id = cur.lastrowid
     return get_asset(new_id, user)
 
@@ -509,7 +501,6 @@ def check_export_key(request: Request):
     if key != EXPORT_API_KEY:
         raise HTTPException(status_code=401, detail="API key inválida")
 
-# Ping protegido: para probar rápidamente la key
 @app.get("/export/public/ping")
 def export_ping(request: Request):
     check_export_key(request)
@@ -562,17 +553,9 @@ def _debug_routes():
 
 @app.get("/_debug/export/check", include_in_schema=False)
 def _debug_export_check():
-    """
-    NO requiere API key. Solo comprueba que fetch_export_rows() funciona.
-    """
     try:
         rows = fetch_export_rows()
-        return {
-            "ok": True,
-            "columns": EXPORT_COLUMNS,
-            "row_count": len(rows),
-            "sample": rows[:3],
-        }
+        return {"ok": True, "columns": EXPORT_COLUMNS, "row_count": len(rows), "sample": rows[:3]}
     except Exception as e:
         import traceback
         return {
@@ -584,27 +567,28 @@ def _debug_export_check():
 
 @app.post("/_debug/seed", include_in_schema=False)
 def _debug_seed(request: Request):
-    """
-    Inserta 2 filas demo. Protegido con la misma API key pública del export.
-    """
-    check_export_key(request)  # requiere ?key=...
+    check_export_key(request)
     from random import randint
     now = datetime.utcnow().isoformat()
     with get_conn() as c:
         cur = c.cursor()
         cur.execute("""INSERT INTO activos 
             (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo, 
-             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+             vida_util_anios, metodo_depreciacion)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (f"Activo Demo {randint(100,999)}", "Equipo de prueba", "IT", "Almacén A",
-             "F-00123", "Proveedor X", "Hardware", "Sistemas", "2025-08-01", 1200.50, "activo", now)
+             "F-00123", "Proveedor X", "Hardware", "Sistemas", "2019-08-01", 1200.50, "activo", now,
+             5.0, "linea_recta")
         )
         cur.execute("""INSERT INTO activos 
             (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo, 
-             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+             vida_util_anios, metodo_depreciacion)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (f"Activo Demo {randint(100,999)}", "Equipo de prueba", "Infraestructura", "Planta 1",
-             "F-00456", "Proveedor Y", "Maquinaria", "Mantenimiento", "2025-07-15", 5400.00, "activo", now)
+             "F-00456", "Proveedor Y", "Maquinaria", "Mantenimiento", "2022-07-15", 5400.00, "activo", now,
+             10.0, "linea_recta")
         )
     return {"ok": True, "msg": "Semilla insertada"}
 
@@ -612,28 +596,19 @@ def _debug_seed(request: Request):
 # IMPORT CSV + WIPE + MIGRACIÓN (endpoints administrativos)
 # =========================
 def _normalize_date(value: str) -> str:
-    """
-    Normaliza fechas a YYYY-MM-DD cuando es posible.
-    Acepta 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD/MM/YYYY', 'MM/DD/YYYY'.
-    Si no reconoce, devuelve tal cual.
-    """
     if not value:
         return ""
     v = str(value).strip().replace("\\", "/")
     try:
-        # YYYY-MM-DD
         if len(v) >= 10 and v[4] == "-" and v[7] == "-":
             return v[:10]
-        # YYYY/MM/DD
         if len(v) >= 10 and v[4] == "/" and v[7] == "/":
             y, m, d = v[:10].split("/")
             return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-        # DD/MM/YYYY
         if "/" in v and len(v) >= 10 and v.count("/") == 2:
             d, m, y = v[:10].split("/")
             if len(y) == 4:
                 return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-        # MM/DD/YYYY
         if "-" not in v and "/" in v and len(v) >= 10:
             m, d, y = v[:10].split("/")
             if len(y) == 4:
@@ -649,7 +624,6 @@ def _to_float(value):
     if s == "" or s.lower() == "nan":
         return None
     s = s.replace(" ", "")
-    # 1.234,56 -> 1234.56
     if s.count(",") == 1 and s.count(".") > 1:
         s = s.replace(".", "").replace(",", ".")
     elif s.count(",") == 1 and "." not in s:
@@ -662,15 +636,9 @@ def _to_float(value):
         return None
 
 def _rows_from_csv(file_stream) -> Iterable[dict]:
-    """
-    Lee un CSV (utf-8/utf-8-sig) y mapea cabeceras comunes a nuestro esquema.
-    Cabeceras objetivo: nombre, descripcion, categoria, ubicacion, factura, proveedor,
-    tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en.
-    """
     wrapper = TextIOWrapper(file_stream, encoding="utf-8-sig")
     reader = csv.DictReader(wrapper)
     header_map = {
-        # iguales
         "id": "id",
         "nombre": "nombre",
         "descripcion": "descripcion",
@@ -684,7 +652,12 @@ def _rows_from_csv(file_stream) -> Iterable[dict]:
         "valor_adquisicion": "valor_adquisicion",
         "estado": "estado",
         "creado_en": "creado_en",
-        # variantes típicas
+        # Nuevos posibles encabezados:
+        "vida_util_anios": "vida_util_anios",
+        "vida útil (años)": "vida_util_anios",
+        "metodo_depreciacion": "metodo_depreciacion",
+        "método_depreciación": "metodo_depreciacion",
+        # variantes
         "numero de activo fijo": "nombre",
         "nombre del activo": "nombre",
         "grupo": "categoria",
@@ -698,7 +671,6 @@ def _rows_from_csv(file_stream) -> Iterable[dict]:
         "valor neto en libros": "valor_adquisicion",
     }
     for raw in reader:
-        # fila completamente vacía -> saltar
         if not any((raw.get(k) or "").strip() for k in raw.keys()):
             continue
         out = {
@@ -714,6 +686,8 @@ def _rows_from_csv(file_stream) -> Iterable[dict]:
             "valor_adquisicion": None,
             "estado": (raw.get("estado") or "").strip() or "activo",
             "creado_en": (raw.get("creado_en") or "").strip() or datetime.utcnow().isoformat(),
+            "vida_util_anios": _to_float(raw.get("vida_util_anios")) if raw.get("vida_util_anios") else 5.0,
+            "metodo_depreciacion": (raw.get("metodo_depreciacion") or "linea_recta").strip() or "linea_recta",
         }
         for k, v in list(raw.items()):
             if v is None:
@@ -725,6 +699,10 @@ def _rows_from_csv(file_stream) -> Iterable[dict]:
                     out["valor_adquisicion"] = _to_float(v)
                 elif mapped == "fecha_ingreso":
                     out["fecha_ingreso"] = _normalize_date(v)
+                elif mapped == "vida_util_anios":
+                    out["vida_util_anios"] = _to_float(v) or 5.0
+                elif mapped == "metodo_depreciacion":
+                    out["metodo_depreciacion"] = str(v).strip() or "linea_recta"
                 elif mapped == "nombre" and not out["nombre"]:
                     out["nombre"] = str(v).strip()
                 elif mapped in out:
@@ -735,10 +713,6 @@ def _rows_from_csv(file_stream) -> Iterable[dict]:
 
 @app.post("/_debug/import/csv", include_in_schema=False)
 async def _debug_import_csv(request: Request):
-    """
-    Sube un CSV (form-data → file) e inserta filas en 'activos'.
-    Requiere ?key=EXPORT_API_KEY.
-    """
     check_export_key(request)
     form = await request.form()
     if "file" not in form:
@@ -751,19 +725,20 @@ async def _debug_import_csv(request: Request):
             cur.execute("""
                 INSERT INTO activos
                 (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
-                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+                 vida_util_anios, metodo_depreciacion)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 row["nombre"], row["descripcion"], row["categoria"], row["ubicacion"],
                 row["factura"], row["proveedor"], row["tipo"], row["area_responsable"],
-                row["fecha_ingreso"], row["valor_adquisicion"], row["estado"], row["creado_en"]
+                row["fecha_ingreso"], row["valor_adquisicion"], row["estado"], row["creado_en"],
+                row["vida_util_anios"], row["metodo_depreciacion"]
             ))
             inserted += 1
     return {"ok": True, "inserted": inserted}
 
 @app.post("/_debug/wipe", include_in_schema=False)
 def _debug_wipe(request: Request):
-    """Borra todos los registros de 'activos'. Requiere ?key=EXPORT_API_KEY."""
     check_export_key(request)
     with get_conn() as c:
         c.execute("DELETE FROM activos")
@@ -771,7 +746,6 @@ def _debug_wipe(request: Request):
 
 @app.post("/_debug/migrate", include_in_schema=False)
 def _debug_migrate(request: Request):
-    """Ejecuta la migración de columnas faltantes en 'activos'. Requiere ?key=EXPORT_API_KEY."""
     check_export_key(request)
     ensure_activos_columns()
     return {"ok": True, "message": "Migración aplicada"}
@@ -795,13 +769,9 @@ def _safe_float(x):
         return 0.0
 
 def _norm_log1p(x: float) -> float:
-    # normaliza log(1+x) a ~[0..1] suponiendo valores hasta 1e6
     return math.log1p(max(0.0, x)) / math.log1p(1_000_000)
 
 def _feature_vector(asset: dict) -> dict:
-    """
-    Devuelve un dict de características ESTABLES (no cambiar nombres una vez publicados).
-    """
     valor = _safe_float(asset.get("valor_adquisicion"))
     antig = _years_since(asset.get("fecha_ingreso") or "")
     estado = (asset.get("estado") or "").strip().lower()
@@ -812,7 +782,7 @@ def _feature_vector(asset: dict) -> dict:
 
     return {
         "f_valor_log": _norm_log1p(valor),
-        "f_antiguedad_anios": min(25.0, antig) / 25.0,        # cap a 25 años
+        "f_antiguedad_anios": min(25.0, antig) / 25.0,
         "f_estado_no_activo": 1.0 if estado not in ("activo", "") else 0.0,
         "f_tiene_factura": 1.0 if factura else 0.0,
         "f_tiene_proveedor": 1.0 if proveedor else 0.0,
@@ -832,16 +802,12 @@ def _sigmoid(z: float) -> float:
         return ez/(1.0+ez)
 
 def _predict_proba(weights: list, x: list) -> float:
-    # weights y x incluyen bias en x[0]=1.0
     z = 0.0
     for w, xi in zip(weights, x):
         z += w * xi
     return _sigmoid(z)
 
 def _rule_score(asset: dict) -> float:
-    """
-    Heurística por si no hay modelo entrenado.
-    """
     score = 0.0
     antig = _years_since(asset.get("fecha_ingreso") or "")
     estado = (asset.get("estado") or "").strip().lower()
@@ -855,26 +821,25 @@ def _get_ai_threshold_default() -> float:
     return float(_get_setting("AI_THRESHOLD_CRITICAL", 0.5))
 
 def _load_model():
-    weights = _get_setting("AI_LOGREG_WEIGHTS", None)  # list de floats, incluye bias
-    feats = _get_setting("AI_FEATURE_NAMES", None)     # orden de features (sin bias)
+    weights = _get_setting("AI_LOGREG_WEIGHTS", None)
+    feats = _get_setting("AI_FEATURE_NAMES", None)
     thr = float(_get_setting("AI_THRESHOLD_CRITICAL", 0.5))
     return weights, feats, thr
 
-# ===== BLOQUE C — IA ENDPOINTS (labels, train, predict, ver modelo) =====
+# ===== BLOQUE C — IA ENDPOINTS
 class TrainRequest(BaseModel):
     epochs: Optional[int] = 300
     lr: Optional[float] = 0.05
     l2: Optional[float] = 0.001
-    threshold: Optional[float] = None  # si no, mantiene o 0.5
+    threshold: Optional[float] = None
 
 class LabelBody(BaseModel):
-    label: int  # 0 = ok, 1 = critico
+    label: int
 
 @app.post("/ia/labels/{asset_id}")
 def ia_add_label(asset_id: int, body: LabelBody, user=Depends(require_role(["supervisor","management"]))):
     if body.label not in (0,1):
         raise HTTPException(status_code=400, detail="label debe ser 0 o 1")
-    # validamos que exista el activo
     with get_conn() as c:
         cur = c.cursor()
         cur.execute("SELECT id FROM activos WHERE id=?", (asset_id,))
@@ -886,7 +851,6 @@ def ia_add_label(asset_id: int, body: LabelBody, user=Depends(require_role(["sup
 
 @app.post("/ia/train")
 def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","management"]))):
-    # 1) Cargar dataset etiquetado
     with get_conn() as c:
         cur = c.cursor()
         cur.execute("""
@@ -906,7 +870,6 @@ def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","managem
 
     dataset = [dict(zip(cols, r)) for r in rows]
 
-    # 2) Construir features y y
     feature_names = ["f_valor_log","f_antiguedad_anios","f_estado_no_activo",
                      "f_tiene_factura","f_tiene_proveedor","f_len_nombre","f_len_desc"]
 
@@ -914,11 +877,10 @@ def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","managem
     y = []
     for d in dataset:
         feats = _feature_vector(d)
-        X.append([1.0] + _vector_to_list(feats, feature_names))  # bias
+        X.append([1.0] + _vector_to_list(feats, feature_names))
         y.append(int(d["label"]))
 
-    n, m = len(X), len(X[0])  # n muestras, m features (incl. bias)
-    # 3) Entrenar regresión logística con GD
+    n, m = len(X), len(X[0])
     w = [0.0]*m
     lr = float(req.lr or 0.05)
     l2 = float(req.l2 or 0.001)
@@ -931,13 +893,11 @@ def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","managem
             err = p - yi
             for j in range(m):
                 grad[j] += err * xi[j]
-        # regularización L2 (no penalizar bias j=0)
         for j in range(1, m):
             grad[j] += l2 * w[j]
         for j in range(m):
             w[j] -= (lr / n) * grad[j]
 
-    # 4) Métricas rápidas
     tp=fp=tn=fn=0
     thr = float(req.threshold) if req.threshold is not None else _get_ai_threshold_default()
     for xi, yi in zip(X, y):
@@ -952,12 +912,10 @@ def ia_train(req: TrainRequest, user=Depends(require_role(["supervisor","managem
     rec = tp/max(1,(tp+fn))
     f1 = 2*prec*rec/max(1e-9,(prec+rec))
 
-    # 5) Guardar modelo
     _set_setting("AI_LOGREG_WEIGHTS", w)
     _set_setting("AI_FEATURE_NAMES", feature_names)
     _set_setting("AI_THRESHOLD_CRITICAL", thr)
-
-    _save_model_file(w, feature_names, thr)  # copia best-effort a archivo
+    _save_model_file(w, feature_names, thr)
 
     return {
         "ok": True,
@@ -978,7 +936,6 @@ def ia_model(user=Depends(require_role(["supervisor","management"]))):
         "threshold": thr
     }
 
-# ===== Endpoints para forzar guardar/cargar el archivo del modelo =====
 @app.post("/ia/persist/save")
 def ia_persist_save(user=Depends(require_role(["supervisor","management"]))):
     w, feats, thr = _load_model()
@@ -999,17 +956,14 @@ def ia_persist_load(user=Depends(require_role(["supervisor","management"]))):
 
 @app.get("/ia/predict/{asset_id}")
 def ia_predict(asset_id: int, user=Depends(get_current_user)):
-    # cargar activo
     with get_conn() as c:
         cur = c.cursor()
-        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
-                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
-                       FROM activos WHERE id=?""", (asset_id,))
+        cur.execute(_COMMON_SELECT + " WHERE id=?", (asset_id,))
         r = cur.fetchone()
     if not r:
         raise HTTPException(status_code=404, detail="Activo no encontrado")
-    cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
-            "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en"]
+    cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor","tipo","area_responsable",
+            "fecha_ingreso","valor_adquisicion","estado","creado_en","vida_util_anios","metodo_depreciacion"]
     a = dict(zip(cols, r))
 
     w, feats, thr = _load_model()
@@ -1043,14 +997,15 @@ def reportes_activos(
     with get_conn() as c:
         cur = c.cursor()
         cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
-                              fecha_ingreso, valor_adquisicion, estado, creado_en, descripcion, factura, proveedor
+                              fecha_ingreso, valor_adquisicion, estado, creado_en, descripcion, factura, proveedor,
+                              vida_util_anios, metodo_depreciacion
                        FROM activos""")
         rows = cur.fetchall()
     cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
-            "fecha_ingreso","valor_adquisicion","estado","creado_en","descripcion","factura","proveedor"]
+            "fecha_ingreso","valor_adquisicion","estado","creado_en","descripcion","factura","proveedor",
+            "vida_util_anios","metodo_depreciacion"]
     data = [dict(zip(cols, r)) for r in rows]
 
-    # IA opcional
     attach_ia = (include_ia or include_ia_model)
     w, feats, thr = _load_model()
     use_model = bool(w and feats) if include_ia_model else False
@@ -1059,13 +1014,9 @@ def reportes_activos(
         for d in data:
             if use_model:
                 x = [1.0] + _vector_to_list(_feature_vector(d), feats)
-                p = _predict_proba(w, x)
-                t = thr
-                src = "model"
+                p = _predict_proba(w, x); t = thr; src = "model"
             else:
-                p = _rule_score(d)
-                t = _get_ai_threshold_default()
-                src = "rules"
+                p = _rule_score(d); t = _get_ai_threshold_default(); src = "rules"
             d["ia_score"] = p
             d["ia_label"] = 1 if p >= t else 0
             d["ia_source"] = src
@@ -1084,7 +1035,6 @@ def reportes_activos(
         ym = fi[:7] if len(fi) >= 7 else "sin_fecha"
         por_mes[ym] = por_mes.get(ym, 0) + 1
 
-    # Limpiar extras no usados en payload base
     for d in data:
         d.pop("descripcion", None)
         d.pop("factura", None)
@@ -1105,7 +1055,75 @@ def reportes_activos(
     }
 
 # =========================
-# DOCUMENTOS PDF (COMPROBANTE INGRESO, ACTA DE BAJA, REPORTE EJECUTIVO)
+# NUEVO: REPORTE DE DEPRECIACIÓN (helper + endpoints)
+# =========================
+
+def _parse_fecha_to_date(fecha_txt: Optional[str]) -> Optional[date]:
+    if not fecha_txt:
+        return None
+    try:
+        return datetime.strptime(fecha_txt[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+def _calc_depreciacion_report():
+    """Calcula el payload de depreciación (reutilizable para endpoint con token y público con API key)."""
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""
+            SELECT id, nombre, categoria, estado, fecha_ingreso, valor_adquisicion,
+                   vida_util_anios, metodo_depreciacion
+            FROM activos
+        """)
+        rows = cur.fetchall()
+
+    hoy = date.today()
+    out = []
+    for (aid, nombre, categoria, estado, f_ing, val, vida_util, metodo) in rows:
+        vida_util = float(vida_util or 0) if vida_util is not None else 0.0
+        val = float(val or 0.0)
+        metodo = (metodo or "linea_recta").strip().lower()
+
+        fi_date = _parse_fecha_to_date(f_ing)
+        anios = max(0.0, (hoy - fi_date).days / 365.25) if fi_date else 0.0
+
+        # Por ahora: línea recta
+        gasto_anual = (val / vida_util) if vida_util > 0 else 0.0
+        dep_acum = min(val, gasto_anual * anios)
+        valor_libros = max(0.0, val - dep_acum)
+        vida_restante = max(0.0, vida_util - anios)
+
+        out.append({
+            "id": aid,
+            "nombre": nombre,
+            "categoria": categoria,
+            "estado": estado,
+            "fecha_ingreso": f_ing,
+            "valor_adquisicion": round(val, 2),
+            "vida_util_anios": round(vida_util, 2),
+            "metodo_depreciacion": metodo,
+            "anios_transcurridos": round(anios, 2),
+            "depreciacion_anual": round(gasto_anual, 2),
+            "depreciacion_acumulada": round(dep_acum, 2),
+            "valor_en_libros": round(valor_libros, 2),
+            "vida_util_restante": round(vida_restante, 2),
+        })
+    return {"detalle": out, "total": len(out), "generado_en": datetime.utcnow().isoformat()}
+
+# Endpoint con token (interno)
+@app.get("/reportes/activos_depreciacion")
+def reporte_activos_depreciacion(user=Depends(get_current_user)):
+    return _calc_depreciacion_report()
+
+# Endpoint público para Power BI (API key por querystring)
+@app.get("/export/public/activos_depreciacion.json")
+def export_depreciacion_public(request: Request):
+    check_export_key(request)  # usa ?key=TU_API_KEY
+    return _calc_depreciacion_report()
+
+
+# =========================
+# DOCUMENTOS PDF
 # =========================
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -1113,14 +1131,13 @@ from reportlab.pdfgen import canvas
 def _fetch_asset(asset_id: int):
     with get_conn() as c:
         cur = c.cursor()
-        cur.execute("""SELECT id, nombre, descripcion, categoria, ubicacion, factura, proveedor,
-                              tipo, area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en
-                       FROM activos WHERE id=?""", (asset_id,))
+        cur.execute(_COMMON_SELECT + " WHERE id=?", (asset_id,))
         r = cur.fetchone()
     if not r:
         raise HTTPException(status_code=404, detail="Activo no encontrado")
     cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
-            "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en"]
+            "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en",
+            "vida_util_anios","metodo_depreciacion"]
     return dict(zip(cols, r))
 
 def _pdf_from_pairs(title: str, pairs: list):
@@ -1161,6 +1178,8 @@ def comprobante_ingreso(asset_id: int, user=Depends(get_current_user)):
         ("Valor adquisición", a.get("valor_adquisicion","")),
         ("Estado", a.get("estado","")),
         ("Registrado en sistema", a.get("creado_en","")),
+        ("Vida útil (años)", a.get("vida_util_anios","")),
+        ("Método depreciación", a.get("metodo_depreciacion","")),
     ]
     buf = _pdf_from_pairs("Comprobante de Ingreso de Activo", pairs)
     return StreamingResponse(buf, media_type="application/pdf",
@@ -1183,6 +1202,8 @@ def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervi
         ("Área responsable", a.get("area_responsable","")),
         ("Valor adquisición", a.get("valor_adquisicion","")),
         ("Estado posterior", "baja"),
+        ("Vida útil (años)", a.get("vida_util_anios","")),
+        ("Método depreciación", a.get("metodo_depreciacion","")),
     ]
     buf = _pdf_from_pairs("Acta de Baja de Bien", pairs)
     return StreamingResponse(buf, media_type="application/pdf",
@@ -1190,7 +1211,7 @@ def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervi
 
 @app.get("/reportes/instantaneo.pdf")
 def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
-    rep = reportes_activos(user=user)  # reutiliza el endpoint optimizado (sin IA por defecto)
+    rep = reportes_activos(user=user)
     k = rep["kpis"]; agg = rep["agregados"]
 
     hoy = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
