@@ -439,23 +439,158 @@ def get_asset(asset_id: int, user=Depends(get_current_user)):
         vida_util_anios=r[13], metodo_depreciacion=r[14]
     )
 
-@app.post("/activos", response_model=AssetOut, status_code=201)
-def create_asset(asset: AssetCreate, user=Depends(require_role(["storekeeper","supervisor"]))):
-    creado_en = datetime.utcnow().isoformat()
-    with get_conn() as c:
-        cur = c.cursor()
-        cur.execute("""
-            INSERT INTO activos (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
-                                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
-                                 vida_util_anios, metodo_depreciacion)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            asset.nombre, asset.descripcion, asset.categoria, asset.ubicacion, asset.factura, asset.proveedor,
-            asset.tipo, asset.area_responsable, asset.fecha_ingreso, asset.valor_adquisicion, asset.estado, creado_en,
-            asset.vida_util_anios, asset.metodo_depreciacion
-        ))
-        new_id = cur.lastrowid
-    return get_asset(new_id, user)
+class BulkInsertResult(BaseModel):
+    inserted: int
+    # Si quieres, luego puedes poblar esto con IDs; de momento devolvemos solo el conteo
+    ids: List[int] = []
+
+def _parse_fecha(valor: Optional[str]) -> Optional[str]:
+    if not valor:
+        return None
+    valor = valor.strip()
+    # Intentos comunes y ISO
+    formatos = ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d")
+    for fmt in formatos:
+        try:
+            return datetime.strptime(valor, fmt).date().isoformat()
+        except ValueError:
+            pass
+    try:
+        # Si viene con hora, nos quedamos con la fecha
+        return datetime.fromisoformat(valor).date().isoformat()
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Fecha inválida: '{valor}'")
+
+def _parse_float(valor: Optional[str]) -> Optional[float]:
+    if valor is None:
+        return None
+    s = valor.strip()
+    if s == "":
+        return None
+    # Soporta "1,234.56" o "1234,56"
+    # Primero intentamos tal cual
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    # Intento con coma decimal
+    try:
+        return float(s.replace('.', '').replace(',', '.'))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Valor numérico inválido: '{valor}'")
+
+@app.post(
+    "/activos",
+    response_model=Union[AssetOut, BulkInsertResult],
+    status_code=201
+)
+async def asset(
+    request: Request,
+    user = Depends(require_role(["storekeeper","supervisor"]))
+):
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    # ------------------ Caso JSON (un solo activo) ------------------
+    if content_type.startswith("application/json"):
+        payload = await request.json()
+        try:
+            asset = AssetCreate(**payload)  # validación con tu esquema
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=e.errors())
+
+        creado_en = datetime.utcnow().isoformat()
+        with get_conn() as c:
+            cur = c.cursor()
+            cur.execute("""
+                INSERT INTO activos (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
+                                     area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+                                     vida_util_anios, metodo_depreciacion)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                asset.nombre, asset.descripcion, asset.categoria, asset.ubicacion, asset.factura, asset.proveedor,
+                asset.tipo, asset.area_responsable, asset.fecha_ingreso, asset.valor_adquisicion, asset.estado,
+                creado_en, asset.vida_util_anios, asset.metodo_depreciacion
+            ))
+            new_id = cur.lastrowid
+
+        return get_asset(new_id, user)
+
+    # ----------- Caso CSV (carga masiva) -----------
+    # Soportamos multipart/form-data (campo 'file') o cuerpo directo text/csv
+    if "multipart/form-data" in content_type or "text/csv" in content_type or "application/octet-stream" in content_type:
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            upload = form.get("file")
+            if not upload:
+                raise HTTPException(status_code=400, detail="Falta el archivo CSV en el campo 'file'.")
+            raw = await upload.read()
+        else:
+            raw = await request.body()
+
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            # fallback común
+            text = raw.decode("latin-1")
+
+        reader = csv.DictReader(io.StringIO(text))
+        # Esperamos cabeceras: id,nombre,categoria,ubicacion,tipo,area_responsable,fecha_ingreso,valor_adquisicion,estado,creado_en
+        expected = {"id","nombre","categoria","ubicacion","tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en"}
+        missing_headers = expected - {h.strip() for h in (reader.fieldnames or [])}
+        if missing_headers:
+            raise HTTPException(status_code=400, detail=f"Faltan columnas en el CSV: {', '.join(sorted(missing_headers))}")
+
+        now_iso = datetime.utcnow().isoformat()
+        rows_to_insert = []
+        line_no = 1  # cuenta la cabecera
+        for row in reader:
+            line_no += 1
+            nombre = (row.get("nombre") or "").strip()
+            if not nombre:
+                raise HTTPException(status_code=400, detail=f"Fila {line_no}: 'nombre' es obligatorio.")
+            categoria = (row.get("categoria") or None)
+            ubicacion = (row.get("ubicacion") or None)
+            tipo = (row.get("tipo") or None)
+            area_responsable = (row.get("area_responsable") or None)
+            fecha_ingreso = _parse_fecha(row.get("fecha_ingreso"))
+            valor_adquisicion = _parse_float(row.get("valor_adquisicion"))
+            estado = (row.get("estado") or None)
+            creado_en_csv = (row.get("creado_en") or "").strip()
+            creado_en = creado_en_csv if creado_en_csv else now_iso
+
+            # Campos opcionales no presentes en el CSV -> None
+            descripcion = None
+            factura = None
+            proveedor = None
+            vida_util_anios = None
+            metodo_depreciacion = None
+
+            rows_to_insert.append((
+                nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
+                area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+                vida_util_anios, metodo_depreciacion
+            ))
+
+        if not rows_to_insert:
+            raise HTTPException(status_code=400, detail="El CSV no contiene filas para insertar.")
+
+        with get_conn() as c:
+            cur = c.cursor()
+            cur.executemany("""
+                INSERT INTO activos (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
+                                     area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
+                                     vida_util_anios, metodo_depreciacion)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows_to_insert)
+            inserted = cur.rowcount if cur.rowcount is not None else len(rows_to_insert)
+
+        return BulkInsertResult(inserted=inserted)
+
+    # Si llegó con otro content-type
+    raise HTTPException(
+        status_code=415,
+        detail="Content-Type no soportado. Usa 'application/json' para un solo activo o 'multipart/form-data'/'text/csv' para CSV."
+    )
 
 @app.put("/activos/{asset_id}")
 def update_asset(asset_id: int, up: AssetUpdate, user=Depends(require_role(["supervisor","technical"]))):
