@@ -542,7 +542,7 @@ def _build_row_from_front(payload: Dict[str, Any], cols_in_db: Set[str]) -> Dict
 @app.post("/activos", response_model=AssetOut, status_code=201)
 def create_asset(
     asset: Dict[str, Any] = Body(...),
-    user = Depends(require_role(["storekeeper", "supervisor"])),
+    user = Depends(require_role(["storekeeper", "supervisor", "management"])),
 ):
     with get_conn() as c:
         cols = _table_columns(c, "activos")
