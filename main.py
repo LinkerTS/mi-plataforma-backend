@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, EmailStr, Field, constr
+from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 import os, sqlite3, io
@@ -11,6 +11,7 @@ from io import TextIOWrapper
 from typing import Iterable
 import joblib  # <-- para guardar/cargar el modelo a archivo
 import shutil  # <-- para migrar archivos a /data
+
 # =========================
 # APP BASE
 # =========================
@@ -438,134 +439,128 @@ def get_asset(asset_id: int, user=Depends(get_current_user)):
         vida_util_anios=r[13], metodo_depreciacion=r[14]
     )
 
-# ---- Modelo según el front ----
-class AssetCreateFront(BaseModel):
-    nombre: constr(strip_whitespace=True, min_length=1)
-    codigo: Optional[str] = None
-    categoria: Optional[str] = None
-    descripcion: Optional[str] = None
-    ubicacion: Optional[str] = None
-    estado: Optional[str] = None
-    fecha_adquisicion: Optional[str] = None  # "YYYY-MM-DD" (pydantic puede parsear, pero guardamos tal cual ISO)
-    precio_inicial: Optional[float] = None
-    vida_util_anos: Optional[int] = Field(default=None, ge=0)
-    valor_residual: Optional[float] = None
-    responsable_email: Optional[EmailStr] = None
+from fastapi import Body, Depends, HTTPException
+from datetime import datetime
+from typing import Any, Dict, Set
+from sqlite3 import Connection
 
-# ---- Utilidades ----
+# --------- helpers muy simples ---------
 def _table_columns(c: Connection, table: str) -> Set[str]:
     cur = c.cursor()
     cur.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cur.fetchall()}  # nombre de columna en idx 1
+    return {row[1] for row in cur.fetchall()}
 
-def _map_payload_to_db(asset: AssetCreateFront, cols: Set[str]) -> Dict[str, Any]:
+def _clean_str(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+def _parse_date(v):
+    if not v:
+        return None
+    if isinstance(v, (datetime,)):
+        return v.date().isoformat()
+    s = str(v).strip()
+    if not s:
+        return None
+    from datetime import datetime as dt
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return dt.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            pass
+    # último intento: ISO con hora
+    try:
+        return dt.fromisoformat(s).date().isoformat()
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"fecha_adquisicion inválida: '{v}'")
+
+def _parse_number(v):
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    # Soporta "1.234,56" y "1,234.56"
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        return float(s.replace(".", "").replace(",", "."))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"valor numérico inválido: '{v}'")
+
+def _build_row_from_front(payload: Dict[str, Any], cols_in_db: Set[str]) -> Dict[str, Any]:
     """
-    Mapea nombres del front -> columnas de la BD si existen.
-    Rellena 'creado_en' con utcnow() si la columna existe.
+    Mapea las claves del front a columnas reales y normaliza valores.
+    Front manda:
+      nombre, codigo, categoria, descripcion, ubicacion, estado,
+      fecha_adquisicion, precio_inicial, vida_util_anos, valor_residual, responsable_email
+    BD (ejemplo):
+      nombre, descripcion, categoria, ubicacion, estado,
+      fecha_ingreso, valor_adquisicion, vida_util_anios,
+      (opcionales) codigo, valor_residual, responsable_email, creado_en, ...
     """
-    # Mapeo de nombres front -> columnas BD
-    mapping = {
-        "nombre": "nombre",
-        "descripcion": "descripcion",
-        "categoria": "categoria",
-        "ubicacion": "ubicacion",
-        "estado": "estado",
-        "fecha_adquisicion": "fecha_ingreso",      # rename
-        "precio_inicial": "valor_adquisicion",     # rename
-        "vida_util_anos": "vida_util_anios",       # sin ñ
-        "codigo": "codigo",                         # opcional si existe
-        "valor_residual": "valor_residual",         # opcional si existe
-        "responsable_email": "responsable_email",   # opcional si existe
+    # 1) sacar valores limpios
+    nombre = _clean_str(payload.get("nombre"))
+    if not nombre:
+        raise HTTPException(400, detail="El campo 'nombre' es obligatorio.")
+
+    row: Dict[str, Any] = {
+        "nombre": nombre,
+        "descripcion": _clean_str(payload.get("descripcion")),
+        "categoria": _clean_str(payload.get("categoria")),
+        "ubicacion": _clean_str(payload.get("ubicacion")),
+        "estado": _clean_str(payload.get("estado")),
+        "fecha_ingreso": _parse_date(payload.get("fecha_adquisicion")),
+        "valor_adquisicion": _parse_number(payload.get("precio_inicial")),
+        "vida_util_anios": _parse_number(payload.get("vida_util_anos")),
+        # opcionales que quizás existan en la tabla
+        "codigo": _clean_str(payload.get("codigo")),
+        "valor_residual": _parse_number(payload.get("valor_residual")),
+        "responsable_email": _clean_str(payload.get("responsable_email")),
+        # timestamps
+        "creado_en": datetime.utcnow().isoformat(),
     }
 
-    src = asset.dict()
-    row: Dict[str, Any] = {}
+    # 2) quita las columnas que NO existen realmente en la tabla
+    row = {k: v for k, v in row.items() if k in cols_in_db}
 
-    # Fechas: normalizamos a YYYY-MM-DD si nos viene algo
-    fecha = src.get("fecha_adquisicion")
-    if fecha:
-        try:
-            # acepta ISO o dd/mm/yyyy o mm/dd/yyyy
-            from datetime import datetime as dt
-            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
-                try:
-                    fecha_iso = dt.strptime(fecha, fmt).date().isoformat()
-                    break
-                except ValueError:
-                    continue
-            else:
-                # último intento: fromisoformat (por si viene con hora)
-                fecha_iso = dt.fromisoformat(fecha).date().isoformat()
-            src["fecha_adquisicion"] = fecha_iso
-        except Exception:
-            raise HTTPException(status_code=400, detail=f"fecha_adquisicion inválida: '{fecha}'")
-
-    for front_key, db_col in mapping.items():
-        if db_col in cols:
-            row[db_col] = src.get(front_key, None)
-
-    # creado_en automático si existe la columna
-    if "creado_en" in cols:
-        row["creado_en"] = datetime.utcnow().isoformat()
-
-    # Campos que tu tabla puede tener pero el front no manda:
-    # Los dejamos en None si existen (evita NOT NULL si tu esquema lo permite).
-    for maybe_optional in ["tipo", "area_responsable", "factura", "proveedor", "metodo_depreciacion"]:
-        if maybe_optional in cols and maybe_optional not in row:
-            row[maybe_optional] = None
+    # 3) algunos campos que tu tabla podría exigir (pero el front no manda)
+    # si existen en la tabla y no tienes valor, los dejamos en None:
+    for maybe in ("tipo", "area_responsable", "factura", "proveedor", "metodo_depreciacion"):
+        if maybe in cols_in_db and maybe not in row:
+            row[maybe] = None
 
     return row
 
-# ---- Ruta ----
+# --------- Ruta súper simple: dict crudo + normalizador ---------
 @app.post("/activos", response_model=AssetOut, status_code=201)
 def create_asset(
-    asset: AssetCreateFront,
-    user = Depends(require_role(["storekeeper", "supervisor"]))
+    asset: Dict[str, Any] = Body(...),
+    user = Depends(require_role(["storekeeper", "supervisor"])),
 ):
     with get_conn() as c:
         cols = _table_columns(c, "activos")
-        row = _map_payload_to_db(asset, cols)
+        row = _build_row_from_front(asset, cols)
 
-        if "nombre" not in row or not row["nombre"]:
-            raise HTTPException(status_code=400, detail="El campo 'nombre' es obligatorio.")
+        columns = list(row.keys())
+        if not columns:
+            raise HTTPException(500, detail="No hay columnas válidas para insertar.")
 
-        # Construimos el INSERT dinámicamente según columnas disponibles
-        col_names = [k for k in row.keys() if k in cols]
-        if not col_names:
-            raise HTTPException(status_code=500, detail="No se encontraron columnas válidas para insertar.")
-
-        placeholders = ", ".join(["?"] * len(col_names))
-        columns_sql = ", ".join(col_names)
-        values = [row[k] for k in col_names]
+        placeholders = ", ".join(["?"] * len(columns))
+        columns_sql = ", ".join(columns)
+        values = [row[k] for k in columns]
 
         cur = c.cursor()
         cur.execute(f"INSERT INTO activos ({columns_sql}) VALUES ({placeholders})", values)
         new_id = cur.lastrowid
 
     return get_asset(new_id, user)
-
-@app.put("/activos/{asset_id}")
-def update_asset(asset_id: int, up: AssetUpdate, user=Depends(require_role(["supervisor","technical"]))):
-    with get_conn() as c:
-        cur = c.cursor()
-        cur.execute("SELECT id FROM activos WHERE id=?", (asset_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail="Activo no encontrado")
-        fields, values = [], []
-        for k, v in up.dict(exclude_unset=True).items():
-            fields.append(f"{k}=?"); values.append(v)
-        if fields:
-            q = f"UPDATE activos SET {', '.join(fields)} WHERE id=?"
-            values.append(asset_id)
-            cur.execute(q, tuple(values))
-    return {"message": "Activo actualizado"}
-
-@app.delete("/activos/{asset_id}")
-def delete_asset(asset_id: int, user=Depends(require_role(["management"]))):
-    with get_conn() as c:
-        cur = c.cursor()
-        cur.execute("DELETE FROM activos WHERE id=?", (asset_id,))
-    return {"message": "Activo eliminado"}
 
 @app.put("/activos/{asset_id}")
 def update_asset(asset_id: int, up: AssetUpdate, user=Depends(require_role(["supervisor","technical"]))):
