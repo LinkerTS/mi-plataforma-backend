@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field, constr
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 import os, sqlite3, io
@@ -11,6 +11,7 @@ from io import TextIOWrapper
 from typing import Iterable
 import joblib  # <-- para guardar/cargar el modelo a archivo
 import shutil  # <-- para migrar archivos a /data
+
 
 # =========================
 # APP BASE
