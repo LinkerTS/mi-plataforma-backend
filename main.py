@@ -439,23 +439,134 @@ def get_asset(asset_id: int, user=Depends(get_current_user)):
         vida_util_anios=r[13], metodo_depreciacion=r[14]
     )
 
+# ---- Modelo según el front ----
+class AssetCreateFront(BaseModel):
+    nombre: constr(strip_whitespace=True, min_length=1)
+    codigo: Optional[str] = None
+    categoria: Optional[str] = None
+    descripcion: Optional[str] = None
+    ubicacion: Optional[str] = None
+    estado: Optional[str] = None
+    fecha_adquisicion: Optional[str] = None  # "YYYY-MM-DD" (pydantic puede parsear, pero guardamos tal cual ISO)
+    precio_inicial: Optional[float] = None
+    vida_util_anos: Optional[int] = Field(default=None, ge=0)
+    valor_residual: Optional[float] = None
+    responsable_email: Optional[EmailStr] = None
+
+# ---- Utilidades ----
+def _table_columns(c: Connection, table: str) -> Set[str]:
+    cur = c.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    return {row[1] for row in cur.fetchall()}  # nombre de columna en idx 1
+
+def _map_payload_to_db(asset: AssetCreateFront, cols: Set[str]) -> Dict[str, Any]:
+    """
+    Mapea nombres del front -> columnas de la BD si existen.
+    Rellena 'creado_en' con utcnow() si la columna existe.
+    """
+    # Mapeo de nombres front -> columnas BD
+    mapping = {
+        "nombre": "nombre",
+        "descripcion": "descripcion",
+        "categoria": "categoria",
+        "ubicacion": "ubicacion",
+        "estado": "estado",
+        "fecha_adquisicion": "fecha_ingreso",      # rename
+        "precio_inicial": "valor_adquisicion",     # rename
+        "vida_util_anos": "vida_util_anios",       # sin ñ
+        "codigo": "codigo",                         # opcional si existe
+        "valor_residual": "valor_residual",         # opcional si existe
+        "responsable_email": "responsable_email",   # opcional si existe
+    }
+
+    src = asset.dict()
+    row: Dict[str, Any] = {}
+
+    # Fechas: normalizamos a YYYY-MM-DD si nos viene algo
+    fecha = src.get("fecha_adquisicion")
+    if fecha:
+        try:
+            # acepta ISO o dd/mm/yyyy o mm/dd/yyyy
+            from datetime import datetime as dt
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+                try:
+                    fecha_iso = dt.strptime(fecha, fmt).date().isoformat()
+                    break
+                except ValueError:
+                    continue
+            else:
+                # último intento: fromisoformat (por si viene con hora)
+                fecha_iso = dt.fromisoformat(fecha).date().isoformat()
+            src["fecha_adquisicion"] = fecha_iso
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"fecha_adquisicion inválida: '{fecha}'")
+
+    for front_key, db_col in mapping.items():
+        if db_col in cols:
+            row[db_col] = src.get(front_key, None)
+
+    # creado_en automático si existe la columna
+    if "creado_en" in cols:
+        row["creado_en"] = datetime.utcnow().isoformat()
+
+    # Campos que tu tabla puede tener pero el front no manda:
+    # Los dejamos en None si existen (evita NOT NULL si tu esquema lo permite).
+    for maybe_optional in ["tipo", "area_responsable", "factura", "proveedor", "metodo_depreciacion"]:
+        if maybe_optional in cols and maybe_optional not in row:
+            row[maybe_optional] = None
+
+    return row
+
+# ---- Ruta ----
 @app.post("/activos", response_model=AssetOut, status_code=201)
-def create_asset(asset: AssetCreate, user=Depends(require_role(["storekeeper","supervisor"]))):
-    creado_en = datetime.utcnow().isoformat()
+def create_asset(
+    asset: AssetCreateFront,
+    user = Depends(require_role(["storekeeper", "supervisor"]))
+):
+    with get_conn() as c:
+        cols = _table_columns(c, "activos")
+        row = _map_payload_to_db(asset, cols)
+
+        if "nombre" not in row or not row["nombre"]:
+            raise HTTPException(status_code=400, detail="El campo 'nombre' es obligatorio.")
+
+        # Construimos el INSERT dinámicamente según columnas disponibles
+        col_names = [k for k in row.keys() if k in cols]
+        if not col_names:
+            raise HTTPException(status_code=500, detail="No se encontraron columnas válidas para insertar.")
+
+        placeholders = ", ".join(["?"] * len(col_names))
+        columns_sql = ", ".join(col_names)
+        values = [row[k] for k in col_names]
+
+        cur = c.cursor()
+        cur.execute(f"INSERT INTO activos ({columns_sql}) VALUES ({placeholders})", values)
+        new_id = cur.lastrowid
+
+    return get_asset(new_id, user)
+
+@app.put("/activos/{asset_id}")
+def update_asset(asset_id: int, up: AssetUpdate, user=Depends(require_role(["supervisor","technical"]))):
     with get_conn() as c:
         cur = c.cursor()
-        cur.execute("""
-            INSERT INTO activos (nombre, descripcion, categoria, ubicacion, factura, proveedor, tipo,
-                                 area_responsable, fecha_ingreso, valor_adquisicion, estado, creado_en,
-                                 vida_util_anios, metodo_depreciacion)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            asset.nombre, asset.descripcion, asset.categoria, asset.ubicacion, asset.factura, asset.proveedor,
-            asset.tipo, asset.area_responsable, asset.fecha_ingreso, asset.valor_adquisicion, asset.estado, creado_en,
-            asset.vida_util_anios, asset.metodo_depreciacion
-        ))
-        new_id = cur.lastrowid
-    return get_asset(new_id, user)
+        cur.execute("SELECT id FROM activos WHERE id=?", (asset_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Activo no encontrado")
+        fields, values = [], []
+        for k, v in up.dict(exclude_unset=True).items():
+            fields.append(f"{k}=?"); values.append(v)
+        if fields:
+            q = f"UPDATE activos SET {', '.join(fields)} WHERE id=?"
+            values.append(asset_id)
+            cur.execute(q, tuple(values))
+    return {"message": "Activo actualizado"}
+
+@app.delete("/activos/{asset_id}")
+def delete_asset(asset_id: int, user=Depends(require_role(["management"]))):
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("DELETE FROM activos WHERE id=?", (asset_id,))
+    return {"message": "Activo eliminado"}
 
 @app.put("/activos/{asset_id}")
 def update_asset(asset_id: int, up: AssetUpdate, user=Depends(require_role(["supervisor","technical"]))):
