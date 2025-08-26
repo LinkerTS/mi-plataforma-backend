@@ -9,3 +9,4 @@ reportlab==4.0.7
 joblib
 matplotlib
 reportlab
+calendar

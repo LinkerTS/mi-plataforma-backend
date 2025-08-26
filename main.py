@@ -11,6 +11,9 @@ from io import TextIOWrapper
 from typing import Iterable
 import joblib  # <-- para guardar/cargar el modelo a archivo
 import shutil  # <-- para migrar archivos a /data
+from calendar import monthrange
+
+
 
 # Render sin GUI
 import matplotlib
@@ -876,6 +879,209 @@ def _debug_migrate(request: Request):
     ensure_activos_columns()
     return {"ok": True, "message": "Migración aplicada"}
 
+# =========================
+# MANTENIMIENTO — Helpers
+# =========================
+
+def _dt_from_txt(s: str):
+    try:
+        return datetime.strptime((s or "")[:10], "%Y-%m-%d")
+    except Exception:
+        return None
+
+def _add_months(dt: date, months: int) -> date:
+    y = dt.year + (dt.month - 1 + months)//12
+    m = (dt.month - 1 + months)%12 + 1
+    d = min(dt.day, monthrange(y, m)[1])
+    return date(y, m, d)
+
+def _months_between(d1: date, d2: date) -> int:
+    # meses (aprox.) entre fechas
+    return max(0, (d2.year - d1.year)*12 + (d2.month - d1.month))
+
+def _base_interval_months(cat: str, tipo: str) -> int:
+    c = (cat or "").strip().lower()
+    t = (tipo or "").strip().lower()
+    if "maquin" in c or "vehic" in c or "maquin" in t or "vehic" in t:
+        return 6       # maquinaria/vehículos
+    if "infra" in c:
+        return 12      # infraestructura
+    if "hard" in t or "equipo" in t:
+        return 12      # hardware/equipo
+    return 12          # por defecto
+
+def _status_from_due(next_due: date, today: date, soon_days: int):
+    days = (next_due - today).days
+    if days <= 0:
+        return ("red", 0, days)       # vencido
+    if days <= max(0, int(soon_days)):
+        return ("yellow", 1, days)    # pronto
+    return ("green", 2, days)         # ok
+
+# =========================
+# MANTENIMIENTO — Próximo por activo
+# =========================
+@app.get("/mantenimiento/proximo/{asset_id}")
+def mantenimiento_proximo(asset_id: int, user=Depends(get_current_user)):
+    # 1) Activo
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute(_COMMON_SELECT + " WHERE id=?", (asset_id,))
+        r = cur.fetchone()
+    if not r:
+        raise HTTPException(status_code=404, detail="Activo no encontrado")
+    cols = ["id","nombre","descripcion","categoria","ubicacion","factura","proveedor",
+            "tipo","area_responsable","fecha_ingreso","valor_adquisicion","estado","creado_en",
+            "vida_util_anios","metodo_depreciacion"]
+    a = dict(zip(cols, r))
+
+    # 2) Riesgo (modelo si existe; si no, reglas)
+    w, feats, thr = _load_model()
+    if w and feats:
+        x = [1.0] + _vector_to_list(_feature_vector(a), feats)
+        proba = _predict_proba(w, x)
+        src = "model"
+    else:
+        proba = _rule_score(a)
+        src = "rules"
+
+    # 3) Antigüedad/vida
+    edad = _years_since(a.get("fecha_ingreso") or "")
+    vida = float(a.get("vida_util_anios") or 0.0)
+    age_frac = min(1.0, (edad / vida)) if vida > 0 else 0.0
+
+    # 4) Intervalo ajustado
+    base_meses = _base_interval_months(a.get("categoria"), a.get("tipo"))
+    factor = 1.0 - 0.6*float(proba) - 0.3*age_frac
+    if not math.isfinite(factor):
+        factor = 1.0
+    factor = max(0.3, min(1.2, factor))
+    interval_meses = max(1, int(round(base_meses * factor)))
+
+    # 5) Referencia y cálculo
+    ref_dt = _dt_from_txt(a.get("fecha_ingreso")) or _dt_from_txt(a.get("creado_en")) or datetime.utcnow()
+    ref = ref_dt.date()
+    today = date.today()
+    if ref >= today:
+        next_due = _add_months(ref, interval_meses)
+    else:
+        n = _months_between(ref, today)
+        k = (n // interval_meses) + 1
+        next_due = _add_months(ref, k * interval_meses)
+
+    return {
+        "asset_id": a["id"],
+        "categoria": a.get("categoria"),
+        "tipo": a.get("tipo"),
+        "edad_anios": round(edad, 2),
+        "vida_util_anios": vida,
+        "ia_proba_critico": round(float(proba), 4),
+        "intervalo_base_meses": base_meses,
+        "intervalo_ajustado_meses": interval_meses,
+        "fecha_referencia": ref.isoformat(),
+        "proxima_fecha_mantenimiento": next_due.isoformat(),
+        "source": src
+    }
+
+# =========================
+# MANTENIMIENTO — Agenda (para Dashboard)
+# =========================
+@app.get("/mantenimiento/agenda")
+def mantenimiento_agenda(
+    soon_days: int = 30,
+    limit_overdue: int = 10,
+    limit_soon: int = 10,
+    limit_ok: int = 10,
+    use_model: int = 1,
+    user=Depends(get_current_user)
+):
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("""SELECT id, nombre, categoria, ubicacion, tipo, area_responsable,
+                              fecha_ingreso, valor_adquisicion, estado, creado_en,
+                              vida_util_anios, metodo_depreciacion
+                       FROM activos""")
+        rows = cur.fetchall()
+
+    cols = ["id","nombre","categoria","ubicacion","tipo","area_responsable",
+            "fecha_ingreso","valor_adquisicion","estado","creado_en",
+            "vida_util_anios","metodo_depreciacion"]
+    items = [dict(zip(cols, r)) for r in rows]
+
+    w, feats, thr = _load_model()
+    use_model_bool = bool(w and feats) if use_model else False
+
+    today = date.today()
+    overdue, soon, ok = [], [], []
+
+    for d in items:
+        # proba
+        if use_model_bool:
+            x = [1.0] + _vector_to_list(_feature_vector(d), feats)
+            p = float(_predict_proba(w, x))
+        else:
+            p = float(_rule_score(d))
+
+        edad = _years_since(d.get("fecha_ingreso") or "")
+        vida = float(d.get("vida_util_anios") or 0.0)
+        age_frac = min(1.0, (edad / vida)) if vida > 0 else 0.0
+        base_meses = _base_interval_months(d.get("categoria"), d.get("tipo"))
+
+        factor = max(0.3, min(1.2, 1.0 - 0.6*p - 0.3*age_frac))
+        interval_meses = max(1, int(round(base_meses * factor)))
+
+        ref_dt = _dt_from_txt(d.get("fecha_ingreso")) or _dt_from_txt(d.get("creado_en")) or datetime.utcnow()
+        ref = ref_dt.date()
+
+        if ref >= today:
+            next_due = _add_months(ref, interval_meses)
+        else:
+            n = _months_between(ref, today)
+            k = (n // interval_meses) + 1
+            next_due = _add_months(ref, k * interval_meses)
+
+        status, severity, days_to_due = _status_from_due(next_due, today, soon_days)
+
+        row = {
+            "id": d["id"],
+            "nombre": d["nombre"],
+            "categoria": d["categoria"],
+            "tipo": d["tipo"],
+            "area_responsable": d["area_responsable"],
+            "proxima_fecha_mantenimiento": next_due.isoformat(),
+            "days_to_due": days_to_due,
+            "maint_status": status,          # red|yellow|green
+            "maint_severity": severity,      # 0|1|2
+            "intervalo_mantenimiento_meses": interval_meses,
+            "ia_score": round(p, 4),
+        }
+
+        if status == "red":
+            overdue.append(row)
+        elif status == "yellow":
+            soon.append(row)
+        else:
+            ok.append(row)
+
+    overdue.sort(key=lambda r: r["days_to_due"])   # más negativo primero
+    soon.sort(key=lambda r: r["days_to_due"])      # más pronto primero
+    ok.sort(key=lambda r: r["days_to_due"])
+
+    return {
+        "kpis": {
+            "total_activos": len(items),
+            "vencidos": len(overdue),
+            "pronto": len(soon),
+            "ok": len(ok),
+            "ventana_pronto_dias": soon_days
+        },
+        "listas": {
+            "overdue": overdue[:max(0, int(limit_overdue))],
+            "soon":    soon[:max(0, int(limit_soon))],
+            "ok":      ok[:max(0, int(limit_ok))]
+        }
+    }
+
 # ===== BLOQUE B — IA HELPERS (features, reglas, regresión) =====
 def _years_since(yyyy_mm_dd: str) -> float:
     if not yyyy_mm_dd:
@@ -1112,12 +1318,14 @@ def ia_predict(asset_id: int, user=Depends(get_current_user)):
     }
 
 # =========================
-# ENDPOINT OPTIMIZADO PARA POWER BI (KPIs + DETALLE)
+# ENDPOINT KPIs + DETALLE (con IA y Mantenimiento opcional)
 # =========================
 @app.get("/reportes/activos")
 def reportes_activos(
     include_ia: int = 0,
     include_ia_model: int = 0,
+    include_maintenance: int = 0,    # NUEVO
+    soon_days: int = 30,              # NUEVO
     user=Depends(get_current_user)
 ):
     with get_conn() as c:
@@ -1135,9 +1343,12 @@ def reportes_activos(
     attach_ia = (include_ia or include_ia_model)
     w, feats, thr = _load_model()
     use_model = bool(w and feats) if include_ia_model else False
+    today = date.today()
 
-    if attach_ia:
-        for d in data:
+    for d in data:
+        # --- IA (si la piden) ---
+        proba_for_maint = None
+        if attach_ia:
             if use_model:
                 x = [1.0] + _vector_to_list(_feature_vector(d), feats)
                 p = _predict_proba(w, x); t = thr; src = "model"
@@ -1146,7 +1357,41 @@ def reportes_activos(
             d["ia_score"] = p
             d["ia_label"] = 1 if p >= t else 0
             d["ia_source"] = src
+            proba_for_maint = float(p)
+        else:
+            proba_for_maint = float(_rule_score(d))
 
+        # --- Mantenimiento (si lo piden) ---
+        if include_maintenance:
+            edad = _years_since(d.get("fecha_ingreso") or "")
+            vida = float(d.get("vida_util_anios") or 0.0)
+            age_frac = min(1.0, (edad / vida)) if vida > 0 else 0.0
+            base_meses = _base_interval_months(d.get("categoria"), d.get("tipo"))
+
+            factor = 1.0 - 0.6*proba_for_maint - 0.3*age_frac
+            if not math.isfinite(factor):
+                factor = 1.0
+            factor = max(0.3, min(1.2, factor))
+            interval_meses = max(1, int(round(base_meses * factor)))
+
+            ref_dt = _dt_from_txt(d.get("fecha_ingreso")) or _dt_from_txt(d.get("creado_en")) or datetime.utcnow()
+            ref = ref_dt.date()
+            if ref >= today:
+                next_due = _add_months(ref, interval_meses)
+            else:
+                n = _months_between(ref, today)
+                k = (n // interval_meses) + 1
+                next_due = _add_months(ref, k * interval_meses)
+
+            status, severity, days_to_due = _status_from_due(next_due, today, soon_days)
+
+            d["intervalo_mantenimiento_meses"] = interval_meses
+            d["proxima_fecha_mantenimiento"] = next_due.isoformat()
+            d["days_to_due"] = days_to_due
+            d["maint_status"] = status          # red | yellow | green
+            d["maint_severity"] = severity      # 0 | 1 | 2
+
+    # ===== KPIs y agregados (igual que tenías) =====
     total = len(data)
     activos = sum(1 for d in data if (d["estado"] or "").lower() == "activo")
     bajas = sum(1 for d in data if (d["estado"] or "").lower() == "baja")
@@ -1161,6 +1406,7 @@ def reportes_activos(
         ym = fi[:7] if len(fi) >= 7 else "sin_fecha"
         por_mes[ym] = por_mes.get(ym, 0) + 1
 
+    # Limpiar campos sensibles
     for d in data:
         d.pop("descripcion", None)
         d.pop("factura", None)
@@ -1179,7 +1425,6 @@ def reportes_activos(
         },
         "detalle": data
     }
-
 # =========================
 # NUEVO: REPORTE DE DEPRECIACIÓN (helper + endpoints)
 # =========================
