@@ -12,6 +12,18 @@ from typing import Iterable
 import joblib  # <-- para guardar/cargar el modelo a archivo
 import shutil  # <-- para migrar archivos a /data
 
+# Render sin GUI
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+
+
 # =========================
 # APP BASE
 # =========================
@@ -1323,36 +1335,150 @@ def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervi
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="acta_baja_{asset_id}.pdf"'})
 
+# --- HELPERS DE GRÁFICAS Y PDF ---
+def _fig_to_png_bytes(fig, dpi=150):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+def _barh_from_dict(d: dict, title: str, xlabel: str, ylabel: str):
+    # Orden descendente por valor
+    items = sorted(d.items(), key=lambda x: x[1], reverse=True)
+    labels = [str(k) for k, _ in items]
+    values = [v for _, v in items]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.barh(labels, values)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.invert_yaxis()
+    for i, v in enumerate(values):
+        ax.text(v, i, f" {v}", va="center")
+    return _fig_to_png_bytes(fig)
+
+def _sort_mes_ingreso_counter(counter: dict):
+    # Ordena YYYY-MM de forma cronológica y deja "sin_fecha" (u otros) al final
+    keys_valid = [k for k in counter.keys() if isinstance(k, str) and len(k) == 7 and k[4] == "-"]
+    keys_valid.sort()
+    ordered = {k: counter[k] for k in keys_valid}
+    for k in counter.keys():
+        if k not in ordered:
+            ordered[k] = counter[k]
+    return ordered
+
+def _normalize_ym(fecha):
+    if not fecha:
+        return "sin_fecha"
+    if isinstance(fecha, (datetime, date)):
+        return fecha.strftime("%Y-%m")
+    s = str(fecha)
+    return s[:7] if len(s) >= 7 else "sin_fecha"
+
+def _tabla_kpis(k):
+    data = [
+        ["Total de activos", "Activos operacionales", "Activos de baja"],
+        [str(k["total_activos"]), str(k["activos_operacionales"]), str(k["activos_baja"])],
+    ]
+    t = Table(data, colWidths=[6*cm, 6*cm, 5*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+        ("ALIGN", (0,0), (-1,-1), "CENTER"),
+        ("FONTSIZE", (0,0), (-1,0), 11),
+        ("FONTSIZE", (0,1), (-1,1), 14),
+        ("BOX", (0,0), (-1,-1), 0.6, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("BOTTOMPADDING", (0,0), (-1,0), 6),
+    ]))
+    return t
+
+def _tabla_preview(detalle, max_rows=15):
+    preview_cols = ["id","nombre","categoria","estado","fecha_ingreso","valor_adquisicion"]
+    data = [preview_cols]
+    for d in detalle[:max_rows]:
+        row = [
+            str(d.get("id","")),
+            str(d.get("nombre","")),
+            str(d.get("categoria","")),
+            str(d.get("estado","")),
+            str(_normalize_ym(d.get("fecha_ingreso",""))),
+            str(d.get("valor_adquisicion","")),
+        ]
+        data.append(row)
+    t = Table(data, repeatRows=1, colWidths=[2*cm,5*cm,3*cm,2.5*cm,3*cm,3*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+        ("ALIGN", (0,0), (-1,0), "CENTER"),
+        ("FONTSIZE", (0,0), (-1,0), 9),
+        ("FONTSIZE", (0,1), (-1,-1), 8),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.grey),
+        ("INNERGRID", (0,0), (-1,-1), 0.25, colors.grey),
+    ]))
+    return t
+
+def _build_pdf_ejecutivo(rep, logo_path=None):
+    """Crea y devuelve BytesIO del PDF con KPIs + 3 gráficas + preview."""
+    k = rep["kpis"]; agg = rep["agregados"]; detalle = rep["detalle"]
+
+    # 1) Preparar imágenes de gráficas
+    g_categoria = _barh_from_dict(agg.get("por_categoria", {}), "Recuento por categoría", "Cantidad", "Categoría")
+    g_estado    = _barh_from_dict(agg.get("por_estado", {}), "Recuento por estado", "Cantidad", "Estado")
+    por_mes_ord = _sort_mes_ingreso_counter(agg.get("por_mes_ingreso", {}))
+    g_mes       = _barh_from_dict(por_mes_ord, "Altas por mes de ingreso", "Cantidad", "YYYY-MM")
+
+    # 2) Construir PDF
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=1.2*cm, rightMargin=1.2*cm,
+        topMargin=1.2*cm, bottomMargin=1.2*cm
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Cabecera
+    story.append(Paragraph("Reporte Ejecutivo - Activos", styles["Title"]))
+    story.append(Paragraph(datetime.utcnow().strftime("Fecha de emisión: %Y-%m-%d %H:%M UTC"), styles["Normal"]))
+    story.append(Spacer(1, 0.4*cm))
+
+    # Logo opcional
+    if logo_path:
+        try:
+            story.append(Image(logo_path, width=3.0*cm, height=3.0*cm))
+            story.append(Spacer(1, 0.3*cm))
+        except Exception:
+            pass
+
+    # KPIs
+    story.append(_tabla_kpis(k))
+    story.append(Spacer(1, 0.5*cm))
+
+    # Gráficas
+    story.append(Paragraph("Distribuciones", styles["Heading2"]))
+    for img_buf in (g_categoria, g_estado, g_mes):
+        story.append(Image(img_buf, width=16*cm, height=7*cm))
+        story.append(Spacer(1, 0.25*cm))
+
+    # Preview de detalle
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph("Muestra de detalle", styles["Heading2"]))
+    story.append(_tabla_preview(detalle))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+# --- TU ENDPOINT (reemplaza el tuyo por este) ---
 @app.get("/reportes/instantaneo.pdf")
 def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
+    # Reutiliza tu endpoint de datos
     rep = reportes_activos(user=user)
-    k = rep["kpis"]; agg = rep["agregados"]
 
-    hoy = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    lines = [
-        ("REPORTE EJECUTIVO - ACTIVOS", ""),
-        ("Fecha de emisión", hoy),
-        ("---- KPIs ----", ""),
-        ("Total de activos", k["total_activos"]),
-        ("Activos operacionales", k["activos_operacionales"]),
-        ("Activos de baja", k["activos_baja"]),
-        ("", ""),
-        ("---- Por estado ----", ""),
-    ]
-    for est, cnt in sorted(agg["por_estado"].items()):
-        lines.append((f"  {est}", cnt))
-    lines.append(("", ""))
-    lines.append(("---- Por categoría ----", ""))
-    for cat, cnt in sorted(agg["por_categoria"].items()):
-        lines.append((f"  {cat}", cnt))
-    lines.append(("", ""))
-    lines.append(("---- Ingresos por mes (YYYY-MM) ----", ""))
-    for mes, cnt in sorted(agg["por_mes_ingreso"].items()):
-        lines.append((f"  {mes}", cnt))
-
-    buf = _pdf_from_pairs("Reporte Ejecutivo de Activos", lines)
-    return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="reporte_ejecutivo.pdf"'})
+    pdf_buf = _build_pdf_ejecutivo(rep)  # puedes pasar logo_path="static/logo.png" si quieres
+    headers = {"Content-Disposition": 'attachment; filename="reporte_ejecutivo.pdf"'}
+    return StreamingResponse(pdf_buf, media_type="application/pdf", headers=headers)
 # =========================
 # FIN
 # =========================

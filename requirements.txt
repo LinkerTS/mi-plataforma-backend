@@ -7,3 +7,361 @@ passlib==1.7.4
 PyJWT==2.8.0
 reportlab==4.0.7
 joblib
+matplotlib
+reportlab
+
+
+
+
+
+Okey mira, vamos ahora a desarrollar la parte de los productos mejor
+cuando yo hago un get a esta ruta: http://127.0.0.1:8080/v1/productos?limit=5&search=&skip=&limit=
+
+
+mi backend acepta 4 parametros por url; type AllProductsRequest struct {
+	CategoryId uint64 `form:"category_id" binding:"omitempty,min=1" example:"1"`
+	Search     string `form:"search" binding:"omitempty" example:"Chiki"`
+	Skip       uint64 `form:"skip" binding:"omitempty,min=0" example:"0"`
+	Limit      uint64 `form:"limit" binding:"required,min=5" example:"5"`
+}
+
+
+yo en m icaso solo mando con limit 5, el backend me devuelve todos los productos asi: {
+    "success": true,
+    "message": "Success",
+    "data": [
+        {
+            "slug": "Cadena-Nirvan-Rock-Tok3",
+            "nombre": "Cadena Nirvan Rock Tok3",
+            "descripcion": "Cadena de marca TOK3 para vestirte con estilo",
+            "imagen": "https://cdns.cadena_tok3.com",
+            "precio_base": "5.99",
+            "numero_compras": 4,
+            "categoria_id": 13,
+            "calificacion": 4,
+            "numero_resenias": 1,
+            "descuento": null,
+            "shipping": null,
+            "mas_vendido": true
+        },
+        {
+            "slug": "Dron-metamax",
+            "nombre": "Dron metamax",
+            "descripcion": "Dron especial para ussos aramenntitsicos",
+            "imagen": "https://dornmetamax.com",
+            "precio_base": "190.99",
+            "numero_compras": 0,
+            "categoria_id": 10,
+            "calificacion": 0,
+            "numero_resenias": 0,
+            "descuento": null,
+            "shipping": null,
+            "mas_vendido": false
+        },
+        {
+            "slug": "Mini-Air-Conditioner-144W",
+            "nombre": "Mini Air Conditioner 144W",
+            "descripcion": "Pequeño aire aconidcionado para cuarto con personas",
+            "imagen": "https://cdns.air_condition.com",
+            "precio_base": "459.99",
+            "numero_compras": 0,
+            "categoria_id": 1,
+            "calificacion": 0,
+            "numero_resenias": 0,
+            "descuento": null,
+            "shipping": null,
+            "mas_vendido": false
+        },
+        {
+            "slug": "Smoke-Caballero-Elegante",
+            "nombre": "Smoke Caballero Elegante",
+            "descripcion": "Smoke casual para caballero confirma",
+            "imagen": "https://cdns.smoking_elegat.com",
+            "precio_base": "109.99",
+            "numero_compras": 10,
+            "categoria_id": 21,
+            "calificacion": 0,
+            "numero_resenias": 0,
+            "descuento": null,
+            "shipping": null,
+            "mas_vendido": true
+        },
+        {
+            "slug": "Dron-RacingV8",
+            "nombre": "Dron RacingV8",
+            "descripcion": "Dron de maxima velocidad chavalin",
+            "imagen": "https://drondecarga.com",
+            "precio_base": "0",
+            "numero_compras": 0,
+            "categoria_id": 10,
+            "calificacion": 0,
+            "numero_resenias": 0,
+            "descuento": null,
+            "shipping": null,
+            "mas_vendido": false
+        }
+    ]
+}
+
+AHora, cuando hago esta solicitud puede ser tanto con el token como sin el token, el endpoint detecta,
+si la solicitud viene con el token entonces devuelve los productos recomendados como ya sabes, y si no hay token es porque no ser ha iniciado sesion
+entonces se va a devolver productos cualquiera, bueno eso ya sabes.
+
+AHora lo segundo, tengo una segunda ruta quew es cuando el usuario le hace click a un producto,
+cuando le hace click se manda una solicitud a: http://127.0.0.1:8080/v1/productos/:slug,
+y mi endpoint retorna tooodaa la informacion asociada a ese producto y esta debe mostrarse en una pagina solo destinada a ese producto, asi como cuando abres un producto en amazon o shein,
+la informacion retornada es la siguiente: {
+    "success": true,
+    "message": "Success",
+    "data": {
+        "slug": "EarBuds-SmartBuds-12",
+        "nombre": "EarBuds SmartBuds 12",
+        "descripcion": "La mejor sensacion de sonido para tu cabezinga",
+        "imagen": "https://cdns.earbuts-12.com",
+        "precio_base": "29.99",
+        "numero_compras": 5,
+        "plog_video": "EarBuds-SmartBuds-12-48Fd3T",
+        "categoria_id": 6,
+        "categoria": {
+            "id": 6,
+            "nombre": "Audifonos",
+            "descripcion": "Audifonos baratos",
+            "padre_id": 1,
+            "categoria": {
+                "id": 1,
+                "nombre": "Electronica",
+                "descripcion": "Articulos de electronica personales y para el hogar",
+                "padre_id": null,
+                "categoria": null,
+                "created_at": "0001-01-01T00:00:00Z"
+            },
+            "created_at": "0001-01-01T00:00:00Z"
+        },
+        "calificacion": 3.5,
+        "numero_resenias": 2,
+        "reviews": [
+            {
+                "id": 1,
+                "usuario_id": 1,
+                "nombre_usuario": "Luis Inga",
+                "pais": "Ecuador",
+                "ciudad": "Guayaquil",
+                "comentario": "Audifono muy bueno el primero, los dos de color x me vinieron fallosos. QUe lastima",
+                "calificacion": 3,
+                "variantes": [
+                    {
+                        "id": 1,
+                        "sku": "EarBuds-SmartBuds-12-Rojo",
+                        "imagen_url": ""
+                    },
+                    {
+                        "id": 2,
+                        "sku": "EarBuds-SmartBuds-12-Azul",
+                        "imagen_url": ""
+                    }
+                ],
+                "created_at": "2025-03-03T03:14:54.273Z"
+            },
+            {
+                "id": 3,
+                "usuario_id": 2,
+                "nombre_usuario": "Tom Oliver",
+                "pais": "Ecuador",
+                "ciudad": "Guayaquil",
+                "comentario": "Buenos audifonos tio",
+                "calificacion": 4,
+                "variantes": [
+                    {
+                        "id": 4,
+                        "sku": "EarBuds-SmartBuds-12-Caki",
+                        "imagen_url": ""
+                    }
+                ],
+                "created_at": "2025-03-03T03:23:51.333Z"
+            }
+        ],
+        "descuento": null,
+        "shipping": null,
+        "mas_vendido": true,
+        "imagenes_titulares": [
+            {
+                "id": 1,
+                "imagen_url": "https://productophoto.png",
+                "tipo": "Principal"
+            },
+            {
+                "id": 2,
+                "imagen_url": "https://earbutscomplementaryphoto.png",
+                "tipo": "Secundario"
+            },
+            {
+                "id": 3,
+                "imagen_url": "https://earbuta12_size_secondary.png",
+                "tipo": "Secundario"
+            },
+            {
+                "id": 4,
+                "imagen_url": "https://colores_varios_photo.png",
+                "tipo": "Secundario"
+            }
+        ],
+        "variantes": [
+            {
+                "id": 1,
+                "sku": "EarBuds-SmartBuds-12-Rojo",
+                "imagen_url": "",
+                "precio_base": "29.99",
+                "stock": 10,
+                "peso": "1.6",
+                "atributos": [
+                    {
+                        "id": 1,
+                        "field": "Color",
+                        "valor": "Rojo",
+                        "ajuste": "0",
+                        "imagen_url": null
+                    }
+                ],
+                "created_at": "2025-03-02T20:12:29.963Z"
+            },
+            {
+                "id": 2,
+                "sku": "EarBuds-SmartBuds-12-Azul",
+                "imagen_url": "",
+                "precio_base": "29.99",
+                "stock": 20,
+                "peso": "1.6",
+                "atributos": [
+                    {
+                        "id": 2,
+                        "field": "Color",
+                        "valor": "Azul",
+                        "ajuste": "0",
+                        "imagen_url": null
+                    }
+                ],
+                "created_at": "2025-03-02T20:12:29.969Z"
+            },
+            {
+                "id": 3,
+                "sku": "EarBuds-SmartBuds-12-Gris",
+                "imagen_url": "",
+                "precio_base": "29.99",
+                "stock": 5,
+                "peso": "1.6",
+                "atributos": [
+                    {
+                        "id": 3,
+                        "field": "Color",
+                        "valor": "Grays",
+                        "ajuste": "0",
+                        "imagen_url": null
+                    }
+                ],
+                "created_at": "2025-03-02T20:12:29.971Z"
+            },
+            {
+                "id": 4,
+                "sku": "EarBuds-SmartBuds-12-Caki",
+                "imagen_url": "",
+                "precio_base": "29.99",
+                "stock": 30,
+                "peso": "1.6",
+                "atributos": [
+                    {
+                        "id": 4,
+                        "field": "Color",
+                        "valor": "Cake",
+                        "ajuste": "0",
+                        "imagen_url": null
+                    }
+                ],
+                "created_at": "2025-03-02T20:12:29.973Z"
+            },
+            {
+                "id": 5,
+                "sku": "EarBuds-SmartBuds-12-Negro",
+                "imagen_url": "",
+                "precio_base": "29.99",
+                "stock": 25,
+                "peso": "1.6",
+                "atributos": [
+                    {
+                        "id": 5,
+                        "field": "Color",
+                        "valor": "Negro",
+                        "ajuste": "0",
+                        "imagen_url": null
+                    }
+                ],
+                "created_at": "2025-03-02T20:12:29.975Z"
+            }
+        ],
+        "atributos": [
+            {
+                "id": 1,
+                "field": "Color",
+                "valor": "Rojo",
+                "ajuste": "0",
+                "imagen_url": null
+            },
+            {
+                "id": 2,
+                "field": "Color",
+                "valor": "Azul",
+                "ajuste": "0",
+                "imagen_url": null
+            },
+            {
+                "id": 3,
+                "field": "Color",
+                "valor": "Grays",
+                "ajuste": "0",
+                "imagen_url": null
+            },
+            {
+                "id": 4,
+                "field": "Color",
+                "valor": "Cake",
+                "ajuste": "0",
+                "imagen_url": null
+            },
+            {
+                "id": 5,
+                "field": "Color",
+                "valor": "Negro",
+                "ajuste": "0",
+                "imagen_url": null
+            }
+        ],
+        "tablas_informacion": [
+            {
+                "id": 1,
+                "nombre_tabla": "Detalles",
+                "informacion": {
+                    "Bluthoot": "Version 3.0",
+                    "Fabricador": "Tozo",
+                    "Modelo": "NC9",
+                    "Proteccion": "IPX7"
+                },
+                "created_At": "2025-03-02T22:15:36.422Z"
+            },
+            {
+                "id": 2,
+                "nombre_tabla": "Tecnico",
+                "informacion": {
+                    "Material": "Plastico Duro",
+                    "Tecnologia": "Wireless, Bluetooth"
+                },
+                "created_At": "2025-03-02T22:18:19.996Z"
+            }
+        ]
+    }
+}
+
+para cada producto se retorna asi, otra cosa a tener en cuenta, si te das cuenta hay tablas de informacion
+esas tablas deben mostrarse en detalles del producto asi como en amazon o shein, otra cosa a tener en cuenta
+son las variantes, esto indica que tanto hay de cada variante, por ejemplo smartbuds de color rojo, ya bueno
+estas variantes deben mostrarse para que el usuario pueda elegir su combinacion deseada, ademas estas variantes
+tienen un ajuste que modifican el precio, es decir se paga un extra a lo que ya cuenta el producto. Si ya no hay stock
+de una variante simplemente muestralo asi como que con otro color o transparente no se.
