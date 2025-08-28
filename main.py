@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, Request 
+from fastapi import FastAPI, HTTPException, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta, date
@@ -13,19 +13,10 @@ import joblib  # <-- para guardar/cargar el modelo a archivo
 import shutil  # <-- para migrar archivos a /data
 from calendar import monthrange
 
-
-
 # Render sin GUI
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet
-
 
 # =========================
 # APP BASE
@@ -315,8 +306,7 @@ class UserCreate(BaseModel):
     password: str
     role: Optional[str] = None
 
-class BajaRequest(BaseModel):
-    motivo: str
+# (Eliminado el BajaRequest duplicado aquí)
 
 # =========================
 # AUTH + ROLES (JWT)
@@ -454,8 +444,6 @@ def get_asset(asset_id: int, user=Depends(get_current_user)):
         vida_util_anios=r[13], metodo_depreciacion=r[14]
     )
 
-from fastapi import Body, Depends, HTTPException
-from datetime import datetime
 from typing import Any, Dict, Set
 from sqlite3 import Connection
 
@@ -1425,6 +1413,7 @@ def reportes_activos(
         },
         "detalle": data
     }
+
 # =========================
 # NUEVO: REPORTE DE DEPRECIACIÓN (helper + endpoints)
 # =========================
@@ -1492,18 +1481,16 @@ def export_depreciacion_public(request: Request):
     check_export_key(request)  # usa ?key=TU_API_KEY
     return _calc_depreciacion_report()
 
-
 # =========================
 # DOCUMENTOS PDF
 # =========================
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
-from reportlab.graphics import renderPDF
 
 # ---------- Helpers generales ----------
 def _fetch_asset(asset_id: int):
@@ -1695,6 +1682,7 @@ def acta_entrega(asset_id: int, body: ActaEntregaBody, user=Depends(get_current_
     return StreamingResponse(pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="acta_entrega_{asset_id}.pdf"'})
 
+# Definición ÚNICA para BajaRequest (solo en documentos)
 class BajaRequest(BaseModel):
     motivo: str = "BAJA POR OBSOLESCENCIA"
 
@@ -1708,6 +1696,7 @@ def acta_baja(asset_id: int, req: BajaRequest, user=Depends(require_role(["super
     pdf = _pdf_acta_generic(a, titulo="BAJA", observacion=obs)
     return StreamingResponse(pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="acta_baja_{asset_id}.pdf"'})
+
 # ===== LOTE: ACTA DE ENTREGA (multi-activos en un solo PDF)
 class ActaEntregaLoteBody(BaseModel):
     asset_ids: List[int]
@@ -1769,7 +1758,6 @@ def acta_entrega_lote(body: ActaEntregaLoteBody, user=Depends(get_current_user))
             [_small("Cargo: _______________________"), _small("Cargo: _______________________"), _small("Cargo: _______________________")],
         ]
         story.append(Table(firmas, colWidths=[5.3*cm, 5.3*cm, 5.3*cm], style=[("ALIGN",(0,0),(-1,-1),"CENTER")]))
-
         if idx < len(body.asset_ids) - 1:
             story.append(Spacer(1, 0.1*cm))
             story.append(PageBreak())
@@ -1778,7 +1766,6 @@ def acta_entrega_lote(body: ActaEntregaLoteBody, user=Depends(get_current_user))
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="acta_entrega_lote.pdf"'})
-
 
 # ===== LOTE: ACTA DE BAJA (multi-activos)
 class ActaBajaLoteBody(BaseModel):
@@ -1844,7 +1831,6 @@ def acta_baja_lote(body: ActaBajaLoteBody, user=Depends(require_role(["superviso
             [_small("Cargo: _______________________"), _small("Cargo: _______________________"), _small("Cargo: _______________________")],
         ]
         story.append(Table(firmas, colWidths=[5.3*cm, 5.3*cm, 5.3*cm], style=[("ALIGN",(0,0),(-1,-1),"CENTER")]))
-
         if idx < len(body.asset_ids) - 1:
             story.append(PageBreak())
 
@@ -1852,7 +1838,6 @@ def acta_baja_lote(body: ActaBajaLoteBody, user=Depends(require_role(["superviso
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="acta_baja_lote.pdf"'})
-
 
 # --- HELPERS DE GRÁFICAS Y PDF ---
 def _fig_to_png_bytes(fig, dpi=150):
@@ -1998,6 +1983,7 @@ def reporte_ejecutivo_pdf(user=Depends(get_current_user)):
     pdf_buf = _build_pdf_ejecutivo(rep)  # puedes pasar logo_path="static/logo.png" si quieres
     headers = {"Content-Disposition": 'attachment; filename="reporte_ejecutivo.pdf"'}
     return StreamingResponse(pdf_buf, media_type="application/pdf", headers=headers)
+
 # =========================
 # FIN
 # =========================
