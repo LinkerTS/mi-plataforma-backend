@@ -1497,8 +1497,15 @@ def export_depreciacion_public(request: Request):
 # DOCUMENTOS PDF
 # =========================
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.graphics.barcode import qr
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics import renderPDF
 
+# ---------- Helpers generales ----------
 def _fetch_asset(asset_id: int):
     with get_conn() as c:
         cur = c.cursor()
@@ -1511,74 +1518,341 @@ def _fetch_asset(asset_id: int):
             "vida_util_anios","metodo_depreciacion"]
     return dict(zip(cols, r))
 
-def _pdf_from_pairs(title: str, pairs: list):
+def _qr_drawing(text: str, size: float = 2.4 * cm) -> Drawing:
+    code = qr.QrCodeWidget(text)
+    b = code.getBounds()
+    w = b[2] - b[0]
+    h = b[3] - b[1]
+    k = min(size / w, size / h)
+    d = Drawing(size, size, transform=[k, 0, 0, k, 0, 0])
+    d.add(code)
+    return d
+
+def _hcell(txt):   # header cell style helper
+    return Paragraph(f"<b>{txt}</b>", getSampleStyleSheet()["BodyText"])
+
+def _small(txt):
+    st = ParagraphStyle("small", fontSize=8, leading=10)
+    return Paragraph(str(txt or ""), st)
+
+def _p(txt):
+    return Paragraph(str(txt or ""), getSampleStyleSheet()["BodyText"])
+
+def _mk_doc(buf):
+    return SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=1.3*cm, rightMargin=1.3*cm, topMargin=1.3*cm, bottomMargin=1.3*cm
+    )
+
+def _line():
+    return Table([[""]], colWidths=[16*cm], style=[("LINEABOVE", (0,0), (-1,-1), 0.5, colors.grey)])
+
+# ---------- Plantilla: Comprobante de Ingreso ----------
+def _pdf_comprobante_ingreso(a: dict, logo_path: str | None = None):
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-    y = h - 50
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, y, title)
-    y -= 25
-    c.setFont("Helvetica", 10)
-    for k, v in pairs:
-        if y < 80:
-            c.showPage(); y = h - 50; c.setFont("Helvetica", 10)
-        c.drawString(50, y, f"{k}: {'' if v is None else v}")
-        y -= 18
-    c.showPage(); c.save()
+    doc = _mk_doc(buf)
+    S = getSampleStyleSheet()
+    story = []
+
+    # Encabezado
+    header_tbl = [
+        [
+            Image(logo_path, width=2.8*cm, height=1.4*cm) if logo_path else "",
+            Paragraph("<b>DEPARTAMENTO FINANCIERO – CONTROL DE BIENES</b><br/>"
+                      "<b>COMPROBANTE DE INGRESO DE ACTIVOS FIJOS</b>", S["Title"]),
+            _qr_drawing(f"ingreso:{a['id']}|{a.get('nombre','')}|{a.get('fecha_ingreso','')}")
+        ]
+    ]
+    story.append(Table(header_tbl, colWidths=[3*cm, 10*cm, 3*cm], style=[
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE")
+    ]))
+    story.append(Spacer(1, 0.25*cm))
+
+    # Datos generales
+    hoy = datetime.utcnow().strftime("%Y-%m-%d")
+    info = [
+        [_hcell("Fecha"), _p(hoy), _hcell("Proveedor"), _p(a.get("proveedor",""))],
+        [_hcell("Custodio"), _p(a.get("area_responsable","")), _hcell("Factura N°"), _p(a.get("factura",""))],
+        [_hcell("Departamento"), _p(a.get("ubicacion","")), _hcell("Fecha de Factura"), _p(a.get("fecha_ingreso",""))],
+        [_hcell("Tipo de Proceso"), _p(a.get("metodo_depreciacion","")), _hcell("Estado"), _p(a.get("estado",""))],
+    ]
+    story.append(Table(info, colWidths=[3.5*cm, 5.5*cm, 3.5*cm, 5.5*cm], style=[
+        ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+        ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    ]))
+    story.append(Spacer(1, 0.35*cm))
+
+    # Detalle del bien
+    detalle_header = [["CÓDIGO", "DESCRIPCIÓN DEL BIEN", "CATEGORÍA", "TIPO", "VALOR (USD)"]]
+    detalle_row = [[
+        f"AF_{str(a['id']).zfill(5)}",
+        f"{a.get('nombre','')}: {a.get('descripcion','')}",
+        a.get("categoria",""), a.get("tipo",""),
+        f"{(a.get('valor_adquisicion') or 0):,.2f}"
+    ]]
+    story.append(Table(detalle_header + detalle_row, colWidths=[3*cm, 7*cm, 2.5*cm, 2.5*cm, 3*cm], style=[
+        ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+        ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+        ("ALIGN",(-1,1),(-1,1),"RIGHT"),
+    ]))
+    story.append(Spacer(1, 0.2*cm))
+
+    # Observaciones
+    story.append(_hcell("Observaciones"))
+    story.append(Paragraph("EL EQUIPO FUE REVISADO Y CODIFICADO EN LA BODEGA. "
+                           "SE ENCUENTRA EN BUEN ESTADO.", S["BodyText"]))
+    story.append(Spacer(1, 0.4*cm))
+
+    # Firmas
+    firmas = [
+        [_small("_______________________________"), "", _small("_______________________________")],
+        [_small("DIRECTOR FINANCIERO"), "", _small("CUSTODIO ENTRANTE")],
+    ]
+    story.append(Table(firmas, colWidths=[6.5*cm, 3*cm, 6.5*cm], style=[("ALIGN",(0,0),(-1,-1),"CENTER")]))
+
+    doc.build(story)
     buf.seek(0)
     return buf
 
+# ---------- Plantilla: Acta (Entrega/Baja) ----------
+def _pdf_acta_generic(a: dict, titulo: str, observacion: str = "", logo_path: str | None = None):
+    buf = io.BytesIO()
+    doc = _mk_doc(buf)
+    S = getSampleStyleSheet()
+    story = []
+
+    # Encabezado
+    story.append(Table([[
+        Image(logo_path, width=2.8*cm, height=1.4*cm) if logo_path else "",
+        Paragraph(f"<b>ACTA DE {titulo.upper()}</b>", S["Title"]),
+        _qr_drawing(f"{titulo.lower()}:{a['id']}|{a.get('nombre','')}")
+    ]], colWidths=[3*cm, 10*cm, 3*cm], style=[("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+    story.append(Spacer(1, 0.25*cm))
+
+    # Datos generales
+    hoy = datetime.utcnow().strftime("%Y-%m-%d")
+    datos = [
+        [_hcell("Fecha"), _p(hoy), _hcell("Departamento / Área"), _p(a.get("ubicacion",""))],
+        [_hcell("Custodio/Responsable"), _p(a.get("area_responsable","")), _hcell("Código"), _p(f"AF_{str(a['id']).zfill(5)}")],
+    ]
+    story.append(Table(datos, colWidths=[3.5*cm, 5.5*cm, 3.5*cm, 5.5*cm], style=[
+        ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+        ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    ]))
+    story.append(Spacer(1, 0.3*cm))
+
+    # Tabla de artículo
+    header = [["UNIDAD DE MEDIDA", "DESCRIPCIÓN DEL BIEN / ARTÍCULO", "ESTADO", "CANTIDAD"]]
+    row = [["UNIDAD",
+            f"{a.get('nombre','')} — {a.get('descripcion','')}",
+            (a.get("estado") or "NUEVO").upper(),
+            "1"]]
+    story.append(Table(header + row, colWidths=[3.5*cm, 8.5*cm, 2*cm, 2*cm], style=[
+        ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+        ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+        ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+        ("ALIGN",(-1,1),(-1,1),"CENTER"),
+    ]))
+    story.append(Spacer(1, 0.2*cm))
+
+    # Observaciones
+    story.append(_hcell("Observación"))
+    story.append(Paragraph(observacion or "SE ENTREGA EL BIEN EN EL ESTADO QUE SE INDICA.", S["BodyText"]))
+    story.append(Spacer(1, 0.45*cm))
+
+    # Firmas (Solicita / Entrega / Recibe)
+    firmas = [
+        [_small("_______________________________"), _small("_______________________________"), _small("_______________________________")],
+        [_small("SOLICITADO POR"), _small("ENTREGA"), _small("RECIBE CONFORME")],
+        [_small("Cargo: _______________________"), _small("Cargo: _______________________"), _small("Cargo: _______________________")],
+    ]
+    story.append(Table(firmas, colWidths=[5.3*cm, 5.3*cm, 5.3*cm], style=[("ALIGN",(0,0),(-1,-1),"CENTER")]))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+# ---------- Endpoints de documentos ----------
 @app.get("/documentos/comprobante/ingreso/{asset_id}.pdf")
 def comprobante_ingreso(asset_id: int, user=Depends(get_current_user)):
     a = _fetch_asset(asset_id)
-    hoy = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    pairs = [
-        ("COMPROBANTE DE INGRESO", ""),
-        ("Fecha de emisión", hoy),
-        ("ID", a["id"]),
-        ("Nombre", a["nombre"]),
-        ("Descripción", a.get("descripcion","")),
-        ("Categoría", a.get("categoria","")),
-        ("Tipo", a.get("tipo","")),
-        ("Ubicación", a.get("ubicacion","")),
-        ("Área responsable", a.get("area_responsable","")),
-        ("Proveedor", a.get("proveedor","")),
-        ("Factura", a.get("factura","")),
-        ("Fecha ingreso", a.get("fecha_ingreso","")),
-        ("Valor adquisición", a.get("valor_adquisicion","")),
-        ("Estado", a.get("estado","")),
-        ("Registrado en sistema", a.get("creado_en","")),
-        ("Vida útil (años)", a.get("vida_util_anios","")),
-        ("Método depreciación", a.get("metodo_depreciacion","")),
-    ]
-    buf = _pdf_from_pairs("Comprobante de Ingreso de Activo", pairs)
-    return StreamingResponse(buf, media_type="application/pdf",
+    pdf = _pdf_comprobante_ingreso(a)  # logo opcional: _pdf_comprobante_ingreso(a, logo_path="static/logo.png")
+    return StreamingResponse(pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="comprobante_ingreso_{asset_id}.pdf"'})
 
-@app.post("/activos/{asset_id}/baja")
-def dar_baja(asset_id:int, req: BajaRequest, user=Depends(require_role(["supervisor","management"]))):
-    with get_conn() as c:
-        cur = c.cursor()
-        cur.execute("UPDATE activos SET estado=? WHERE id=?", ("baja", asset_id))
+class ActaEntregaBody(BaseModel):
+    observacion: Optional[str] = "SE ENTREGA EL BIEN EN ESTADO NUEVO"
+
+@app.post("/documentos/acta/entrega/{asset_id}.pdf")
+def acta_entrega(asset_id: int, body: ActaEntregaBody, user=Depends(get_current_user)):
     a = _fetch_asset(asset_id)
-    hoy = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    pairs = [
-        ("ACTA DE BAJA", ""),
-        ("Fecha", hoy),
-        ("ID", a["id"]),
-        ("Nombre", a["nombre"]),
-        ("Motivo de baja", req.motivo),
-        ("Ubicación", a.get("ubicacion","")),
-        ("Área responsable", a.get("area_responsable","")),
-        ("Valor adquisición", a.get("valor_adquisicion","")),
-        ("Estado posterior", "baja"),
-        ("Vida útil (años)", a.get("vida_util_anios","")),
-        ("Método depreciación", a.get("metodo_depreciacion","")),
-    ]
-    buf = _pdf_from_pairs("Acta de Baja de Bien", pairs)
-    return StreamingResponse(buf, media_type="application/pdf",
+    pdf = _pdf_acta_generic(a, titulo="ENTREGA/RECEPCIÓN", observacion=body.observacion)
+    return StreamingResponse(pdf, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="acta_entrega_{asset_id}.pdf"'})
+
+class BajaRequest(BaseModel):
+    motivo: str = "BAJA POR OBSOLESCENCIA"
+
+@app.post("/documentos/acta/baja/{asset_id}.pdf")
+def acta_baja(asset_id: int, req: BajaRequest, user=Depends(require_role(["supervisor","management"]))):
+    # Cambia estado a baja
+    with get_conn() as c:
+        c.execute("UPDATE activos SET estado=? WHERE id=?", ("baja", asset_id))
+    a = _fetch_asset(asset_id)
+    obs = f"MOTIVO DE BAJA: {req.motivo}"
+    pdf = _pdf_acta_generic(a, titulo="BAJA", observacion=obs)
+    return StreamingResponse(pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="acta_baja_{asset_id}.pdf"'})
+# ===== LOTE: ACTA DE ENTREGA (multi-activos en un solo PDF)
+class ActaEntregaLoteBody(BaseModel):
+    asset_ids: List[int]
+    observacion: Optional[str] = "SE ENTREGA EL BIEN EN EL ESTADO QUE SE INDICA."
+
+@app.post("/documentos/acta/entrega/lote.pdf")
+def acta_entrega_lote(body: ActaEntregaLoteBody, user=Depends(get_current_user)):
+    if not body.asset_ids:
+        raise HTTPException(400, "asset_ids vacío")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=1.3*cm, rightMargin=1.3*cm, topMargin=1.3*cm, bottomMargin=1.3*cm
+    )
+    S = getSampleStyleSheet()
+    story = []
+    for idx, aid in enumerate(body.asset_ids):
+        a = _fetch_asset(aid)
+        # Reutiliza la misma maquetación del acta genérica:
+        # (copiamos el contenido esencial para construir cada página)
+        story.append(Table([[
+            "",  # logo opcional
+            Paragraph(f"<b>ACTA DE ENTREGA/RECEPCIÓN</b>", S["Title"]),
+            _qr_drawing(f"entrega:{a['id']}|{a.get('nombre','')}")
+        ]], colWidths=[3*cm, 10*cm, 3*cm], style=[("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+        story.append(Spacer(1, 0.25*cm))
+
+        hoy = datetime.utcnow().strftime("%Y-%m-%d")
+        datos = [
+            [ _hcell("Fecha"), _p(hoy), _hcell("Departamento / Área"), _p(a.get("ubicacion","")) ],
+            [ _hcell("Custodio/Responsable"), _p(a.get("area_responsable","")), _hcell("Código"), _p(f"AF_{str(a['id']).zfill(5)}") ],
+        ]
+        story.append(Table(datos, colWidths=[3.5*cm, 5.5*cm, 3.5*cm, 5.5*cm], style=[
+            ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+            ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+            ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ]))
+        story.append(Spacer(1, 0.3*cm))
+
+        header = [["UNIDAD DE MEDIDA", "DESCRIPCIÓN DEL BIEN / ARTÍCULO", "ESTADO", "CANTIDAD"]]
+        row = [["UNIDAD", f"{a.get('nombre','')} — {a.get('descripcion','')}", (a.get('estado') or 'NUEVO').upper(), "1"]]
+        story.append(Table(header + row, colWidths=[3.5*cm, 8.5*cm, 2*cm, 2*cm], style=[
+            ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+            ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+            ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+            ("ALIGN",(-1,1),(-1,1),"CENTER"),
+        ]))
+        story.append(Spacer(1, 0.2*cm))
+
+        story.append(_hcell("Observación"))
+        story.append(Paragraph(body.observacion or "", S["BodyText"]))
+        story.append(Spacer(1, 0.45*cm))
+
+        firmas = [
+            [_small("_______________________________"), _small("_______________________________"), _small("_______________________________")],
+            [_small("SOLICITADO POR"), _small("ENTREGA"), _small("RECIBE CONFORME")],
+            [_small("Cargo: _______________________"), _small("Cargo: _______________________"), _small("Cargo: _______________________")],
+        ]
+        story.append(Table(firmas, colWidths=[5.3*cm, 5.3*cm, 5.3*cm], style=[("ALIGN",(0,0),(-1,-1),"CENTER")]))
+
+        if idx < len(body.asset_ids) - 1:
+            story.append(Spacer(1, 0.1*cm))
+            story.append(PageBreak())
+
+    doc.build(story)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="acta_entrega_lote.pdf"'})
+
+
+# ===== LOTE: ACTA DE BAJA (multi-activos)
+class ActaBajaLoteBody(BaseModel):
+    asset_ids: List[int]
+    motivo: str = "BAJA POR OBSOLESCENCIA"
+
+@app.post("/documentos/acta/baja/lote.pdf")
+def acta_baja_lote(body: ActaBajaLoteBody, user=Depends(require_role(["supervisor","management"]))):
+    if not body.asset_ids:
+        raise HTTPException(400, "asset_ids vacío")
+
+    # Opcional: cambiar estado a 'baja' de todos
+    with get_conn() as c:
+        c.executemany("UPDATE activos SET estado=? WHERE id=?", [("baja", aid) for aid in body.asset_ids])
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=1.3*cm, rightMargin=1.3*cm, topMargin=1.3*cm, bottomMargin=1.3*cm
+    )
+    S = getSampleStyleSheet()
+    story = []
+    for idx, aid in enumerate(body.asset_ids):
+        a = _fetch_asset(aid)
+
+        story.append(Table([[
+            "",  # logo opcional
+            Paragraph("<b>ACTA DE BAJA</b>", S["Title"]),
+            _qr_drawing(f"baja:{a['id']}|{a.get('nombre','')}")
+        ]], colWidths=[3*cm, 10*cm, 3*cm], style=[("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+        story.append(Spacer(1, 0.25*cm))
+
+        hoy = datetime.utcnow().strftime("%Y-%m-%d")
+        datos = [
+            [ _hcell("Fecha"), _p(hoy), _hcell("Departamento / Área"), _p(a.get("ubicacion","")) ],
+            [ _hcell("Custodio/Responsable"), _p(a.get("area_responsable","")), _hcell("Código"), _p(f"AF_{str(a['id']).zfill(5)}") ],
+        ]
+        story.append(Table(datos, colWidths=[3.5*cm, 5.5*cm, 3.5*cm, 5.5*cm], style=[
+            ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+            ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+            ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ]))
+        story.append(Spacer(1, 0.3*cm))
+
+        header = [["UNIDAD DE MEDIDA", "DESCRIPCIÓN DEL BIEN / ARTÍCULO", "ESTADO", "CANTIDAD"]]
+        row = [["UNIDAD", f"{a.get('nombre','')} — {a.get('descripcion','')}", (a.get('estado') or 'BAJA').upper(), "1"]]
+        story.append(Table(header + row, colWidths=[3.5*cm, 8.5*cm, 2*cm, 2*cm], style=[
+            ("BACKGROUND",(0,0),(-1,0),colors.whitesmoke),
+            ("BOX",(0,0),(-1,-1),0.6,colors.grey),
+            ("INNERGRID",(0,0),(-1,-1),0.25,colors.grey),
+            ("ALIGN",(-1,1),(-1,1),"CENTER"),
+        ]))
+        story.append(Spacer(1, 0.2*cm))
+
+        story.append(_hcell("Observación"))
+        story.append(Paragraph(f"MOTIVO DE BAJA: {body.motivo}", S["BodyText"]))
+        story.append(Spacer(1, 0.45*cm))
+
+        firmas = [
+            [_small("_______________________________"), _small("_______________________________"), _small("_______________________________")],
+            [_small("SOLICITADO POR"), _small("ENTREGA"), _small("RECIBE CONFORME")],
+            [_small("Cargo: _______________________"), _small("Cargo: _______________________"), _small("Cargo: _______________________")],
+        ]
+        story.append(Table(firmas, colWidths=[5.3*cm, 5.3*cm, 5.3*cm], style=[("ALIGN",(0,0),(-1,-1),"CENTER")]))
+
+        if idx < len(body.asset_ids) - 1:
+            story.append(PageBreak())
+
+    doc.build(story)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="acta_baja_lote.pdf"'})
+
 
 # --- HELPERS DE GRÁFICAS Y PDF ---
 def _fig_to_png_bytes(fig, dpi=150):
